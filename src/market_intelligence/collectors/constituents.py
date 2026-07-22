@@ -135,6 +135,18 @@ def sync(config: Config, *, transport: httpx.BaseTransport | None = None) -> Run
         result = duckdb_store.upsert_constituents(con, rows)
         summary.inserted = result.inserted
         summary.updated = result.updated
+        # Without this the count identity silently fails: rows collapsed by the
+        # upsert for sharing a natural key would vanish with no counter
+        # explaining why inserted + updated fell short of collected. A non-zero
+        # value here means the reconstruction emitted two windows with the same
+        # (index_id, ticker, added_date), which is worth noticing rather than
+        # absorbing.
+        summary.deduped = result.deduped
+        if result.deduped:
+            summary.note(
+                f"{result.deduped} window(s) collapsed on a shared "
+                "(index_id, ticker, added_date); the reconstruction produced duplicates"
+            )
 
         parquet.write_records(
             config.paths.parquet_dir, "index_constituents", rows, ["constituent_id"]

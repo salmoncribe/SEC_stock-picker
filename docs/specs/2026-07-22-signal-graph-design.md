@@ -155,6 +155,28 @@ DuckDB insert/update split. Re-running extraction over the same filings reports
 Purged/embargoed splitting: samples whose forward-return window overlaps the split boundary
 are dropped, so no holdout label is partly determined by discovery-period prices.
 
+### Statistics must be clustered, never computed per row
+
+**The unit of observation is the (company, event-day), not the event.** Measured on the
+first real dataset (2026-07-22), one vesting event produced 327 Form 4 line items for APP on
+a single day and 264 for TSLA — each a separate sample carrying an *identical* forward
+return. Counted as independent draws, 327 copies of one fact inflate confidence by roughly
+√327. Across the dataset the naive t-statistic ran about **3x** the clustered one (insider
+sales at 20 days: t = −51 naive, t = −17 clustered).
+
+A gate using per-row statistics would therefore admit cells at roughly three times its
+intended confidence — precisely the failure the gate exists to prevent, arriving through the
+arithmetic rather than through the data. Every statistic in `signals/impact.py` must
+aggregate to one observation per (target, t0) before computing means, hit rates, or test
+statistics.
+
+Residual dependence remains after clustering and should be treated as a known overstatement
+rather than ignored: multi-day windows still overlap in time for the same company, and
+insiders across different companies transact in the same post-earnings windows, so
+observations share a common factor. Newey-West or Fama-MacBeth standard errors are the
+correct next refinement. Until then, admission thresholds should be set conservatively and
+the reported `t_stat` documented as an upper bound on confidence.
+
 ## 7. Data quality and error handling
 
 - **Delisted symbols.** A free price API returns an empty series for a dead ticker, which
@@ -204,7 +226,8 @@ Stages are sequential; each ships working and testable before the next begins.
 | 1b | 8-K item-code events (structured metadata, no LLM) | Item codes parsed for every 8-K in the universe |
 | 1c | 10-K/10-Q documents + LLM edge extraction | Spot-check edge accuracy on 20 filings |
 | 2 | Dataset builder | Leakage tests pass |
-| 3 | Validation gate | **Both** controls behave: null signal rejected, Form 4 detected |
+| 2 | Dataset builder | **Done 2026-07-22.** 718,502 samples; leakage tests pass |
+| 3 | Validation gate | **Both** controls behave: null signal rejected, Form 4 detected. Statistics clustered per (target, t0) |
 | 4 | Graph lifecycle | Dedup + bitemporal tests pass |
 | 5 | Obsidian projection + alerts | Vault regenerates from empty; alerts cite sources |
 

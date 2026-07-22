@@ -189,6 +189,27 @@ OBSERVATION_COLUMNS: tuple[str, ...] = (
 )  # fmt: skip
 
 
+CONSTITUENT_COLUMNS: tuple[str, ...] = (
+    "constituent_id", "index_id", "company_id", "cik", "ticker", "company_name",
+    "added_date", "removed_date", "source", "source_url", "content_hash",
+    "schema_version", "validation_status", "validation_errors", "collected_time",
+)  # fmt: skip
+
+DAILY_PRICE_COLUMNS: tuple[str, ...] = (
+    "price_id", "symbol", "price_date", "open", "high", "low", "close",
+    "adj_close", "volume", "provider", "is_delisted_gap", "source", "source_url",
+    "content_hash", "schema_version", "validation_status", "validation_errors",
+    "collected_time",
+)  # fmt: skip
+
+DAILY_RETURN_COLUMNS: tuple[str, ...] = (
+    "return_id", "symbol", "price_date", "total_return", "market_return",
+    "sector_return", "abnormal_return", "beta", "alpha", "method",
+    "estimation_window_start", "source", "source_url", "content_hash",
+    "schema_version", "validation_status", "validation_errors", "collected_time",
+)  # fmt: skip
+
+
 def upsert_companies(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
     return upsert(
         con,
@@ -235,6 +256,43 @@ def upsert_observations(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> 
         rows,
         key_cols=["series_id", "observation_date", "realtime_start", "realtime_end"],
         columns=OBSERVATION_COLUMNS,
+    )
+
+
+def upsert_constituents(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
+    """Upsert index-membership windows.
+
+    Keyed on ``(index_id, ticker, added_date)`` rather than ``(index_id,
+    ticker)``: a company that leaves an index and later rejoins has two
+    distinct membership windows, and collapsing them onto one key would
+    silently overwrite the first with the second, erasing the gap between them.
+    """
+    return upsert(
+        con,
+        "index_constituents",
+        rows,
+        key_cols=["index_id", "ticker", "added_date"],
+        columns=CONSTITUENT_COLUMNS,
+    )
+
+
+def upsert_daily_prices(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
+    return upsert(
+        con,
+        "daily_prices",
+        rows,
+        key_cols=["symbol", "price_date"],
+        columns=DAILY_PRICE_COLUMNS,
+    )
+
+
+def upsert_daily_returns(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
+    return upsert(
+        con,
+        "daily_returns",
+        rows,
+        key_cols=["symbol", "price_date"],
+        columns=DAILY_RETURN_COLUMNS,
     )
 
 

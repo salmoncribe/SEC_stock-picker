@@ -8,6 +8,7 @@ Commands::
     market-intelligence sec collect-ipos [--forms S-1,S-1/A,F-1,F-1/A]
     market-intelligence sec ingest-documents [--ticker NVDA] [--limit N]
     market-intelligence sec sync-insider [--start-quarter 2016q1] [--end-quarter 2024q4]
+    market-intelligence sec sync-filing-events [--forms 8-K] [--ticker NVDA]
     market-intelligence fred sync [--series DGS10,UNRATE]
     market-intelligence market sync-constituents
     market-intelligence market sync-prices [--symbols NVDA,MU] [--start YYYY-MM-DD]
@@ -36,6 +37,7 @@ from market_intelligence.analytics.returns import AbnormalReturnMethod
 from market_intelligence.collectors import RunSummary
 from market_intelligence.collectors import constituents as constituents_collector
 from market_intelligence.collectors import documents as document_collector
+from market_intelligence.collectors import filing_events as filing_events_collector
 from market_intelligence.collectors import fred as fred_collector
 from market_intelligence.collectors import insider as insider_collector
 from market_intelligence.collectors import prices as price_collector
@@ -101,6 +103,11 @@ def _split_csv(value: str | None) -> list[str] | None:
         return None
     items = [part.strip() for part in value.split(",") if part.strip()]
     return items or None
+
+
+def _split_csv_tuple(value: str | None) -> tuple[str, ...] | None:
+    items = _split_csv(value)
+    return tuple(items) if items else None
 
 
 def _emit_summary(summary: RunSummary) -> None:
@@ -409,6 +416,29 @@ def sec_sync_insider(
     config = _load()
     _run(
         lambda: insider_collector.sync(config, start_quarter=start_quarter, end_quarter=end_quarter)
+    )
+
+
+@sec_app.command("sync-filing-events")
+def sec_sync_filing_events(
+    ticker: str | None = typer.Option(None, "--ticker", help="Restrict to a single ticker."),
+    forms: str | None = typer.Option(
+        None, "--forms", help="Comma-separated forms; default = 8-K (amendments excluded)."
+    ),
+    limit: int | None = typer.Option(None, "--limit", help="Max filings to process."),
+) -> None:
+    """Emit one event per (8-K, item code) from preserved submissions data.
+
+    Reads the raw store rather than the network, so it is fast and offline.
+    Each item code becomes its own event with a neutral direction; the sign of
+    each code's effect is left for ``signals evaluate`` to measure.
+    """
+    config = _load()
+    tickers = [ticker] if ticker else None
+    _run(
+        lambda: filing_events_collector.sync(
+            config, forms=_split_csv_tuple(forms), tickers=tickers, limit=limit
+        )
     )
 
 

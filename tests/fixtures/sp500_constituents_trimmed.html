@@ -1,0 +1,206 @@
+<!--
+  Trimmed excerpt of https://en.wikipedia.org/wiki/List_of_S%26P_500_companies
+  (fetched 2026-07-22), reduced from ~500 rows to a handful chosen to exercise
+  every reconstruction case in clients/constituents.py:
+
+    MMM / ABT   - simple, single-window tickers with no "changes" table events
+    AOS         - simple ticker with a "Date added" that postdates 1957
+    FOXA / FOX  - same-day close-then-reopen under an unchanged ticker
+                  (21st Century Fox -> Fox Corporation), the tie-break case
+    Q           - reused three times (Qwest -> QuintilesIMS -> Qnity
+                  Electronics): a genuine remove-then-rejoin, twice over,
+                  whose first window is also floor-dated (pre-coverage)
+    META        - present in "current" with no "changes" row of its own,
+                  so ticker FB (below) correctly resolves to "not current"
+    FB          - added once (2013), never removed in the changes table and
+                  absent from "current": the undocumented-departure case
+                  (Facebook's ticker change to META was never logged here)
+    CAG         - removed once (2026), no prior "added" row: a standalone
+                  floor-dated (pre-coverage) closed window
+    EW / IQV / WFM - incidental added/removed tickers pulled in by the rows
+                  above; not asserted on directly
+
+  The final "changes" row (ticker ZZZZ, date "Unknown") is a synthetic addition,
+  not from the live page, added solely to exercise the unparseable-date path.
+-->
+<table class="wikitable sortable" id="constituents">
+  <tbody>
+    <tr>
+      <th><a href="https://en.wikipedia.org/wiki/Ticker_symbol" title="Ticker symbol">Symbol</a></th>
+      <th>Security</th>
+      <th><a href="https://en.wikipedia.org/wiki/Global_Industry_Classification_Standard" title="Global Industry Classification Standard">GICS</a> Sector</th>
+      <th>GICS Sub-Industry</th>
+      <th>Headquarters Location</th>
+      <th>Date added</th>
+      <th><a href="https://en.wikipedia.org/wiki/Central_Index_Key" title="Central Index Key">CIK</a></th>
+      <th>Founded</th>
+    </tr>
+    <tr>
+      <td>MMM</td>
+      <td>3M</td>
+      <td>Industrials</td>
+      <td>Industrial Conglomerates</td>
+      <td>Saint Paul, Minnesota</td>
+      <td>1957-03-04</td>
+      <td>0000066740</td>
+      <td>1902</td>
+    </tr>
+    <tr>
+      <td>AOS</td>
+      <td>A. O. Smith</td>
+      <td>Industrials</td>
+      <td>Building Products</td>
+      <td>Milwaukee, Wisconsin</td>
+      <td>2017-07-26</td>
+      <td>0000091142</td>
+      <td>1916</td>
+    </tr>
+    <tr>
+      <td>ABT</td>
+      <td>Abbott Laboratories</td>
+      <td>Health Care</td>
+      <td>Health Care Equipment</td>
+      <td>North Chicago, Illinois</td>
+      <td>1957-03-04</td>
+      <td>0000001800</td>
+      <td>1888</td>
+    </tr>
+    <tr>
+      <td>FOXA</td>
+      <td>Fox Corporation (Class A)</td>
+      <td>Communication Services</td>
+      <td>Broadcasting</td>
+      <td>New York City, New York</td>
+      <td>2019-03-19</td>
+      <td>0001754301</td>
+      <td>2019</td>
+    </tr>
+    <tr>
+      <td>FOX</td>
+      <td>Fox Corporation (Class B)</td>
+      <td>Communication Services</td>
+      <td>Broadcasting</td>
+      <td>New York City, New York</td>
+      <td>2019-03-19</td>
+      <td>0001754301</td>
+      <td>2019</td>
+    </tr>
+    <tr>
+      <td>META</td>
+      <td>Meta Platforms</td>
+      <td>Communication Services</td>
+      <td>Interactive Media &amp; Services</td>
+      <td>Menlo Park, California</td>
+      <td>2013-12-23</td>
+      <td>0001326801</td>
+      <td>2004</td>
+    </tr>
+    <tr>
+      <td>Q</td>
+      <td>Qnity Electronics</td>
+      <td>Information Technology</td>
+      <td>Semiconductor Materials &amp; Equipment</td>
+      <td>Wilmington, Delaware</td>
+      <td>2025-11-03</td>
+      <td>0002058873</td>
+      <td>2025</td>
+    </tr>
+  </tbody>
+</table>
+
+<table class="wikitable sortable" id="changes">
+  <tbody>
+    <tr>
+      <th rowspan="2">Effective Date</th>
+      <th colspan="2">Added</th>
+      <th colspan="2">Removed</th>
+      <th rowspan="2">Reason</th>
+    </tr>
+    <tr>
+      <th>Ticker</th>
+      <th>Security</th>
+      <th>Ticker</th>
+      <th>Security</th>
+    </tr>
+    <tr>
+      <td>June 30, 2026</td>
+      <td></td>
+      <td></td>
+      <td>CAG</td>
+      <td>Conagra Brands</td>
+      <td>Market capitalization change.<sup class="reference">[5]</sup></td>
+    </tr>
+    <tr>
+      <td>November 3, 2025</td>
+      <td>Q</td>
+      <td>Qnity Electronics</td>
+      <td></td>
+      <td></td>
+      <td>S&amp;P 500 constituent DuPont de Nemours, Inc. spun off Qnity Electronics.</td>
+    </tr>
+    <tr>
+      <td>March 19, 2019</td>
+      <td>FOXA</td>
+      <td>Fox Corporation</td>
+      <td>FOXA</td>
+      <td>21st Century Fox</td>
+      <td>21st Century Fox merged with Disney and some parts spun off as Fox Corporation.<sup class="reference">[12]</sup></td>
+    </tr>
+    <tr>
+      <td>March 19, 2019</td>
+      <td>FOX</td>
+      <td>Fox Corporation</td>
+      <td>FOX</td>
+      <td>21st Century Fox</td>
+      <td>21st Century Fox merged with Disney and some parts spun off as Fox Corporation.<sup class="reference">[12]</sup></td>
+    </tr>
+    <tr>
+      <td>November 15, 2017</td>
+      <td>IQV</td>
+      <td>IQVIA</td>
+      <td>Q</td>
+      <td>QuintilesIMS</td>
+      <td>QuintilesIMS changed its name to IQVIA and ticker symbol from Q to IQV.</td>
+    </tr>
+    <tr>
+      <td>August 29, 2017</td>
+      <td>Q</td>
+      <td>QuintilesIMS</td>
+      <td>WFM</td>
+      <td>Whole Foods Market</td>
+      <td>Amazon acquired Whole Foods Market.</td>
+    </tr>
+    <tr>
+      <td>September 18, 2015</td>
+      <td>FOX</td>
+      <td>Twenty-First Century Fox Class B</td>
+      <td></td>
+      <td></td>
+      <td>Share class methodology change.</td>
+    </tr>
+    <tr>
+      <td>December 23, 2013</td>
+      <td>FB</td>
+      <td>Facebook</td>
+      <td>TER</td>
+      <td>Teradyne</td>
+      <td>Market capitalization changes.</td>
+    </tr>
+    <tr>
+      <td>March 31, 2011</td>
+      <td>EW</td>
+      <td>Edwards Lifesciences</td>
+      <td>Q</td>
+      <td>Qwest Communications</td>
+      <td>Acquired by CenturyLink.</td>
+    </tr>
+    <tr>
+      <td>Unknown</td>
+      <td>ZZZZ</td>
+      <td>Synthetic Test Co</td>
+      <td></td>
+      <td></td>
+      <td>Synthetic row for testing the unparseable-date path; not from the live page.</td>
+    </tr>
+  </tbody>
+</table>

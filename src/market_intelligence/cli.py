@@ -8,6 +8,9 @@ Commands::
     market-intelligence sec collect-ipos [--forms S-1,S-1/A,F-1,F-1/A]
     market-intelligence sec ingest-documents [--ticker NVDA] [--limit N]
     market-intelligence fred sync [--series DGS10,UNRATE]
+    market-intelligence market sync-constituents
+    market-intelligence market sync-prices [--symbols NVDA,MU] [--start YYYY-MM-DD]
+    market-intelligence market compute-returns [--benchmark SPY] [--method market_model]
     market-intelligence validate
     market-intelligence reconcile [--no-verify-hashes]
     market-intelligence status
@@ -18,15 +21,20 @@ Exit codes: 0 success, 1 pipeline/runtime failure, 2 configuration error.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from market_intelligence import __version__, database, reconciliation
+from market_intelligence.analytics.returns import AbnormalReturnMethod
 from market_intelligence.collectors import RunSummary
+from market_intelligence.collectors import constituents as constituents_collector
 from market_intelligence.collectors import documents as document_collector
 from market_intelligence.collectors import fred as fred_collector
+from market_intelligence.collectors import prices as price_collector
+from market_intelligence.collectors import returns as returns_collector
 from market_intelligence.collectors import sec as sec_collector
 from market_intelligence.config import Config, ConfigError, get_config
 from market_intelligence.logging_config import configure_logging, get_logger
@@ -38,8 +46,12 @@ app = typer.Typer(
 )
 sec_app = typer.Typer(help="SEC EDGAR collection.", no_args_is_help=True)
 fred_app = typer.Typer(help="FRED economic-data collection.", no_args_is_help=True)
+market_app = typer.Typer(
+    help="Index membership, prices, and derived returns.", no_args_is_help=True
+)
 app.add_typer(sec_app, name="sec")
 app.add_typer(fred_app, name="fred")
+app.add_typer(market_app, name="market")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -414,6 +426,77 @@ def fred_sync(
     """Download configured FRED series metadata and observations."""
     config = _load()
     _run(lambda: fred_collector.sync(config, series_ids=_split_csv(series)))
+
+
+# --------------------------------------------------------------------------- #
+# Market subcommands                                                           #
+# --------------------------------------------------------------------------- #
+@market_app.command("sync-constituents")
+def market_sync_constituents() -> None:
+    """Collect point-in-time S&P 500 index membership.
+
+    Windows whose added_date is an approximation rather than an attested date
+    are stored with validation_status='warning' and the reason in
+    validation_errors, so a point-in-time query can exclude them.
+    """
+    config = _load()
+    _run(lambda: constituents_collector.sync(config))
+
+
+@market_app.command("sync-prices")
+def market_sync_prices(
+    symbols: str | None = typer.Option(
+        None, "--symbols", help="Comma-separated tickers; default = the collected index universe."
+    ),
+    start: datetime | None = typer.Option(
+        None, "--start", formats=["%Y-%m-%d"], help="Earliest bar to request (YYYY-MM-DD)."
+    ),
+    end: datetime | None = typer.Option(
+        None, "--end", formats=["%Y-%m-%d"], help="Latest bar to request (YYYY-MM-DD)."
+    ),
+) -> None:
+    """Download daily OHLCV bars. Resumable: re-running fetches only what is new."""
+    config = _load()
+    _run(
+        lambda: price_collector.sync(
+            config,
+            symbols=_split_csv(symbols),
+            start=start.date() if start else None,
+            end=end.date() if end else None,
+        )
+    )
+
+
+@market_app.command("compute-returns")
+def market_compute_returns(
+    symbols: str | None = typer.Option(
+        None, "--symbols", help="Comma-separated tickers; default = everything with prices."
+    ),
+    benchmark: str = typer.Option(
+        returns_collector.DEFAULT_BENCHMARK, "--benchmark", help="Benchmark symbol."
+    ),
+    method: str = typer.Option(
+        AbnormalReturnMethod.MARKET_MODEL.value,
+        "--method",
+        help="market_model | market_adjusted | sector_adjusted",
+    ),
+) -> None:
+    """Derive abnormal returns from already-collected prices. Reads, never refetches."""
+    config = _load()
+    try:
+        chosen = AbnormalReturnMethod(method)
+    except ValueError as exc:
+        valid = ", ".join(m.value for m in AbnormalReturnMethod)
+        err_console.print(f"[red]Unknown method[/red] {method!r}. Expected one of: {valid}")
+        raise typer.Exit(code=2) from exc
+    _run(
+        lambda: returns_collector.compute(
+            config,
+            symbols=_split_csv(symbols),
+            benchmark=benchmark,
+            method=chosen,
+        )
+    )
 
 
 def main() -> None:

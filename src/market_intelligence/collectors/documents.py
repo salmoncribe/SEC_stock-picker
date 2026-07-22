@@ -57,6 +57,10 @@ TEXTUAL_SUFFIXES: tuple[str, ...] = (".htm", ".html", ".txt")
 
 PREVIEW_CHARS = 300
 
+#: Filings ingested between writes. Small enough that an interruption costs
+#: little, large enough that the Parquet merge-write is not the bottleneck.
+DEFAULT_FLUSH_EVERY = 100
+
 
 def _preview(text: str) -> str:
     collapsed = " ".join(text.split())
@@ -74,8 +78,21 @@ def select_candidates(
     tickers: list[str] | None = None,
     forms: list[str] | None = None,
     limit: int | None = None,
+    skip_ingested: bool = True,
 ) -> list[dict[str, Any]]:
-    """Read the filings eligible for document ingestion, newest first."""
+    """Read the filings eligible for document ingestion, newest first.
+
+    ``skip_ingested`` subtracts filings already present in ``filing_documents``,
+    which is what makes a long backfill resumable: each run picks up where the
+    last one stopped instead of re-downloading from the top. Persisting results
+    incrementally is only half of resumability -- without this subtraction a
+    restart would faithfully store everything it already had, spending hours of
+    SEC rate limit to learn nothing.
+
+    Matched on ``accession_number`` rather than ``filing_id`` because the
+    accession is SEC's own identifier and is always populated, whereas
+    ``filing_id`` is ours and may be absent on older rows.
+    """
     wanted = list(forms) if forms else list(SECTIONABLE_FORMS)
     params: list[Any] = list(wanted)
     sql = f"""
@@ -87,6 +104,13 @@ def select_candidates(
           AND primary_document <> ''
           AND validation_status <> 'rejected'
     """
+    if skip_ingested:
+        sql += """
+          AND NOT EXISTS (
+              SELECT 1 FROM filing_documents d
+              WHERE d.accession_number = filings.accession_number
+          )
+        """
     if tickers:
         uppered = [t.upper() for t in tickers]
         placeholders = ", ".join(["?"] * len(uppered))
@@ -274,6 +298,49 @@ def _ingest_one(
     return document.to_row(), section_rows
 
 
+def _flush(
+    config: Config,
+    con: duckdb.DuckDBPyConnection,
+    summary: RunSummary,
+    document_rows: list[dict[str, Any]],
+    section_rows: list[dict[str, Any]],
+) -> None:
+    """Persist one batch and fold its counts into the running summary.
+
+    Counters accumulate with ``+=`` rather than being assigned, because this is
+    called many times per run; assigning would silently report only the last
+    batch and make the run look far smaller than it was.
+    """
+    if not document_rows and not section_rows:
+        return
+
+    summary.collected += len(document_rows)
+
+    doc_result = duckdb_store.upsert_filing_documents(con, document_rows)
+    summary.inserted += doc_result.inserted
+    summary.updated += doc_result.updated
+    summary.deduped += doc_result.deduped
+
+    section_result = duckdb_store.upsert_filing_sections(con, section_rows)
+    summary.bump("sections_offered", len(section_rows))
+    summary.bump("sections_inserted", section_result.inserted)
+    summary.bump("sections_updated", section_result.updated)
+    summary.bump("sections_deduped", section_result.deduped)
+
+    parquet.write_records(
+        config.paths.parquet_dir,
+        "filing_documents",
+        document_rows,
+        ["accession_number", "document_name"],
+    )
+    parquet.write_records(
+        config.paths.parquet_dir,
+        "filing_sections",
+        section_rows,
+        ["accession_number", "item_code"],
+    )
+
+
 def ingest_documents(
     config: Config,
     *,
@@ -281,10 +348,22 @@ def ingest_documents(
     forms: list[str] | None = None,
     limit: int | None = None,
     transport: Any = None,
+    flush_every: int = DEFAULT_FLUSH_EVERY,
+    skip_ingested: bool = True,
 ) -> RunSummary:
-    """Download and section the filings already recorded in ``filings``."""
+    """Download and section the filings already recorded in ``filings``.
+
+    Results are written every ``flush_every`` filings rather than once at the
+    end. A full backfill runs for hours against a rate-limited SEC, so an
+    end-of-run write would mean an interruption at filing 22,000 of 22,892
+    persisted nothing at all. Flushing in batches bounds the loss from any
+    interruption to at most one batch, and combined with ``skip_ingested`` in
+    :func:`select_candidates` it makes the backfill restartable to completion.
+    """
     with pipeline_run(config, "sec.ingest-documents") as (con, summary):
-        candidates = select_candidates(con, tickers=tickers, forms=forms, limit=limit)
+        candidates = select_candidates(
+            con, tickers=tickers, forms=forms, limit=limit, skip_ingested=skip_ingested
+        )
         summary.bump("candidates", len(candidates))
 
         document_rows: list[dict[str, Any]] = []
@@ -303,32 +382,18 @@ def ingest_documents(
                     document_rows.append(document)
                     section_rows.extend(sections)
 
-        summary.collected = len(document_rows)
+                if len(document_rows) >= flush_every:
+                    _flush(config, con, summary, document_rows, section_rows)
+                    document_rows = []
+                    section_rows = []
 
-        doc_result = duckdb_store.upsert_filing_documents(con, document_rows)
-        summary.inserted = doc_result.inserted
-        summary.updated = doc_result.updated
-        summary.deduped = doc_result.deduped
-
-        section_result = duckdb_store.upsert_filing_sections(con, section_rows)
-        summary.bump("sections_offered", len(section_rows))
-        summary.bump("sections_inserted", section_result.inserted)
-        summary.bump("sections_updated", section_result.updated)
-        summary.bump("sections_deduped", section_result.deduped)
-
-        parquet.write_records(
-            config.paths.parquet_dir,
-            "filing_documents",
-            document_rows,
-            ["accession_number", "document_name"],
-        )
-        parquet.write_records(
-            config.paths.parquet_dir,
-            "filing_sections",
-            section_rows,
-            ["accession_number", "item_code"],
-        )
+        _flush(config, con, summary, document_rows, section_rows)
     return summary
 
 
-__all__ = ["SECTIONABLE_FORMS", "ingest_documents", "select_candidates"]
+__all__ = [
+    "DEFAULT_FLUSH_EVERY",
+    "SECTIONABLE_FORMS",
+    "ingest_documents",
+    "select_candidates",
+]

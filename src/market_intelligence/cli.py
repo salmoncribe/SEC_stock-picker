@@ -364,18 +364,26 @@ def sec_ingest_documents(
         None, "--forms", help="Comma-separated forms; default = 10-K/10-Q (and amendments)."
     ),
     limit: int | None = typer.Option(None, "--limit", help="Max filings to ingest."),
+    reingest: bool = typer.Option(
+        False, "--reingest", help="Re-fetch filings already ingested (default: skip them)."
+    ),
 ) -> None:
     """Download filing documents, preserve the bytes, and extract Item sections.
 
-    Operates on filings already recorded by ``collect-filings``. Re-running is
-    safe: unchanged documents are skipped at the raw store and rows are upserted
-    rather than duplicated.
+    Operates on filings already recorded by ``collect-filings``. Resumable:
+    filings already in ``filing_documents`` are skipped, results are written
+    every few filings, and an interrupted run keeps everything it finished. Run
+    it repeatedly until the candidate count reaches zero.
     """
     config = _load()
     tickers = [ticker] if ticker else None
     _run(
         lambda: document_collector.ingest_documents(
-            config, tickers=tickers, forms=_split_csv(forms), limit=limit
+            config,
+            tickers=tickers,
+            forms=_split_csv(forms),
+            limit=limit,
+            skip_ingested=not reingest,
         )
     )
 

@@ -314,6 +314,25 @@ SAMPLE_COLUMNS: tuple[str, ...] = (
 )  # fmt: skip
 
 
+IMPACT_STAT_COLUMNS: tuple[str, ...] = (
+    "stat_id", "event_type", "event_subtype", "edge_type", "horizon_days",
+    "split", "n_samples", "n_clusters", "mean_car", "median_car", "std_car",
+    "hit_rate", "t_stat", "verdict", "verdict_reason", "source", "source_url",
+    "content_hash", "schema_version", "validation_status", "validation_errors",
+    "collected_time",
+)  # fmt: skip
+
+
+def upsert_impact_stats(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
+    return upsert(
+        con,
+        "impact_stats",
+        rows,
+        key_cols=["event_type", "event_subtype", "edge_type", "horizon_days", "split"],
+        columns=IMPACT_STAT_COLUMNS,
+    )
+
+
 def upsert_event_samples(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
     return upsert(
         con,

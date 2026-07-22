@@ -24,6 +24,7 @@ TABLES: tuple[str, ...] = (
     "daily_returns",
     "events",
     "event_samples",
+    "impact_stats",
     "pipeline_runs",
 )
 
@@ -326,6 +327,45 @@ SCHEMA_STATEMENTS: dict[str, str] = {
             validation_errors       TEXT,
             collected_time          TIMESTAMPTZ,
             UNIQUE (event_id, edge_id, horizon_days)
+        )
+    """,
+    # Measured behaviour of one (event kind, edge kind, horizon) combination on
+    # one split, plus the verdict on whether it may fire alerts.
+    #
+    # n_samples and n_clusters are both stored and they are not redundant:
+    # n_clusters is the number of independent observations (one per company-day)
+    # and is what every statistic here is computed from, while n_samples is the
+    # raw row count. Keeping both makes the clustering visible rather than
+    # implicit -- a large gap between them is exactly the condition under which
+    # an unclustered statistic would have been badly overconfident.
+    #
+    # The verdict is a property of the cell, not of a split: it is decided on
+    # discovery and stamped on both rows so either can be read alone.
+    "impact_stats": """
+        CREATE TABLE IF NOT EXISTS impact_stats (
+            stat_id           TEXT PRIMARY KEY,
+            event_type        TEXT NOT NULL,
+            event_subtype     TEXT,
+            edge_type         TEXT NOT NULL,
+            horizon_days      INTEGER NOT NULL,
+            split             TEXT NOT NULL,
+            n_samples         INTEGER,
+            n_clusters        INTEGER,
+            mean_car          DOUBLE,
+            median_car        DOUBLE,
+            std_car           DOUBLE,
+            hit_rate          DOUBLE,
+            t_stat            DOUBLE,
+            verdict           TEXT,
+            verdict_reason    TEXT,
+            source            TEXT,
+            source_url        TEXT,
+            content_hash      TEXT,
+            schema_version    TEXT,
+            validation_status TEXT,
+            validation_errors TEXT,
+            collected_time    TIMESTAMPTZ,
+            UNIQUE (event_type, event_subtype, edge_type, horizon_days, split)
         )
     """,
     "pipeline_runs": """

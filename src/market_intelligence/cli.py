@@ -13,6 +13,7 @@ Commands::
     market-intelligence market sync-prices [--symbols NVDA,MU] [--start YYYY-MM-DD]
     market-intelligence market compute-returns [--benchmark SPY] [--method market_model]
     market-intelligence signals build-dataset [--subtypes P,S] [--horizons 1,5,20]
+    market-intelligence signals evaluate [--no-placebo]
     market-intelligence validate
     market-intelligence reconcile [--no-verify-hashes]
     market-intelligence status
@@ -30,6 +31,7 @@ from rich.console import Console
 from rich.table import Table
 
 from market_intelligence import __version__, database, reconciliation
+from market_intelligence.analytics.impact import AdmissionThresholds
 from market_intelligence.analytics.returns import AbnormalReturnMethod
 from market_intelligence.collectors import RunSummary
 from market_intelligence.collectors import constituents as constituents_collector
@@ -42,6 +44,7 @@ from market_intelligence.collectors import sec as sec_collector
 from market_intelligence.config import Config, ConfigError, get_config
 from market_intelligence.logging_config import configure_logging, get_logger
 from market_intelligence.signals import dataset as dataset_builder
+from market_intelligence.signals import impact as impact_gate
 
 app = typer.Typer(
     help="Local market-intelligence data platform (baseline).",
@@ -610,6 +613,27 @@ def signals_build_dataset(
             split_date=split_date.date(),
         )
     )
+
+
+@signals_app.command("evaluate")
+def signals_evaluate(
+    placebo: bool = typer.Option(
+        True, "--placebo/--no-placebo", help="Also measure randomly-paired control cells."
+    ),
+    min_clusters: int = typer.Option(
+        200, "--min-clusters", help="Independent observations required."
+    ),
+    min_abs_t: float = typer.Option(3.0, "--min-t", help="Minimum |t| on the discovery split."),
+    min_car: float = typer.Option(
+        0.002, "--min-car", help="Minimum |mean CAR| to count as economically real."
+    ),
+) -> None:
+    """Measure every cell and decide which may fire alerts."""
+    config = _load()
+    thresholds = AdmissionThresholds(
+        min_clusters=min_clusters, min_abs_t=min_abs_t, min_abs_mean_car=min_car
+    )
+    _run(lambda: impact_gate.evaluate(config, thresholds=thresholds, with_placebo=placebo))
 
 
 def main() -> None:

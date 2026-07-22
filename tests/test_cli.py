@@ -72,6 +72,20 @@ def test_collect_filings_without_sec_user_agent_exits_2(monkeypatch: pytest.Monk
     assert result.exit_code == 2
 
 
+def test_sync_insider_help() -> None:
+    result = runner.invoke(app, ["sec", "sync-insider", "--help"])
+    assert result.exit_code == 0
+    assert "--start-quarter" in result.output
+    assert "--end-quarter" in result.output
+
+
+def test_sync_insider_without_sec_user_agent_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SEC_USER_AGENT", "MarketIntelligence/0.1 (you@example.com)")
+    reset_config_cache()
+    result = runner.invoke(app, ["sec", "sync-insider"])
+    assert result.exit_code == 2
+
+
 def test_fred_sync_without_key_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FRED_API_KEY", raising=False)
     reset_config_cache()

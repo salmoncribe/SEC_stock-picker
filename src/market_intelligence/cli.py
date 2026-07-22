@@ -7,6 +7,7 @@ Commands::
     market-intelligence sec collect-filings --ticker NVDA [--forms 10-K,10-Q,8-K] [--limit N]
     market-intelligence sec collect-ipos [--forms S-1,S-1/A,F-1,F-1/A]
     market-intelligence sec ingest-documents [--ticker NVDA] [--limit N]
+    market-intelligence sec sync-insider [--start-quarter 2016q1] [--end-quarter 2024q4]
     market-intelligence fred sync [--series DGS10,UNRATE]
     market-intelligence market sync-constituents
     market-intelligence market sync-prices [--symbols NVDA,MU] [--start YYYY-MM-DD]
@@ -33,6 +34,7 @@ from market_intelligence.collectors import RunSummary
 from market_intelligence.collectors import constituents as constituents_collector
 from market_intelligence.collectors import documents as document_collector
 from market_intelligence.collectors import fred as fred_collector
+from market_intelligence.collectors import insider as insider_collector
 from market_intelligence.collectors import prices as price_collector
 from market_intelligence.collectors import returns as returns_collector
 from market_intelligence.collectors import sec as sec_collector
@@ -68,6 +70,7 @@ _VALIDATED_TABLES = (
     "index_constituents",
     "daily_prices",
     "daily_returns",
+    "events",
 )
 
 
@@ -367,6 +370,30 @@ def sec_ingest_documents(
         lambda: document_collector.ingest_documents(
             config, tickers=tickers, forms=_split_csv(forms), limit=limit
         )
+    )
+
+
+@sec_app.command("sync-insider")
+def sec_sync_insider(
+    start_quarter: str | None = typer.Option(
+        None, "--start-quarter", help="Earliest quarter id, e.g. 2016q1 (default: 2006q1)."
+    ),
+    end_quarter: str | None = typer.Option(
+        None, "--end-quarter", help="Latest quarter id, e.g. 2024q4 (default: the current quarter)."
+    ),
+) -> None:
+    """Collect SEC's pre-parsed quarterly Form 3/4/5 insider-transaction datasets.
+
+    Emits one event per non-derivative transaction for issuers in the
+    collected universe (companies/filings CIKs, falling back to priced
+    tickers). Resumable: a quarter already stored is skipped, and a run
+    interrupted partway through leaves every earlier quarter's events durably
+    persisted. A 404 for the most recent quarter means SEC has not published
+    it yet, not a failure.
+    """
+    config = _load()
+    _run(
+        lambda: insider_collector.sync(config, start_quarter=start_quarter, end_quarter=end_quarter)
     )
 
 

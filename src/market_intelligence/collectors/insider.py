@@ -84,13 +84,30 @@ EARLIEST_QUARTER = "2006q1"
 
 @dataclass(frozen=True)
 class _Universe:
-    """The collected universe, loaded once per run.
+    """The admissible issuer set, loaded once per run.
 
-    ``cik_set`` is the union of ``companies.cik`` and ``filings.cik`` -- an
-    issuer counts as "in universe" if either table has ever recorded it.
-    ``ticker_set`` is every symbol with stored price history, the fallback
-    when an issuer's CIK is not on file (e.g. a company observed only via
-    index membership + prices, not yet filing-collected).
+    **This is deliberately much wider than the index universe, and callers must
+    not assume otherwise.** ``cik_set`` unions ``companies.cik`` with
+    ``filings.cik``, and ``companies`` holds SEC's *entire* ticker map -- ~8,000
+    registrants, not the ~874 that were ever S&P 500 members. So ``events`` ends
+    up covering roughly 8,000 issuers, of which only ~657 currently have price
+    history to measure against.
+
+    That breadth is kept on purpose rather than narrowed. The surplus rows cost
+    almost nothing (DuckDB stores millions of them trivially) and they are free
+    optionality: the insider effect is documented to be *strongest* in small,
+    thinly-covered names, which is the same slow-diffusion mechanism this
+    platform is built to exploit. If price coverage is ever widened, the events
+    are already collected and no re-run is needed.
+
+    The consequence for consumers: **anything measuring returns must inner-join
+    ``events`` to ``daily_returns``**, which is what narrows ~4.5M stored events
+    to the ~1.6M on priced names. Treating a raw ``events`` count as the
+    measurable sample size would overstate it roughly threefold.
+
+    ``ticker_set`` is every symbol with stored price history -- the fallback
+    when an issuer's CIK is not on file (e.g. a company observed only via index
+    membership and prices, not yet filing-collected).
     """
 
     cik_set: frozenset[str]

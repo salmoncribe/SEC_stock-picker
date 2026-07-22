@@ -12,6 +12,7 @@ Commands::
     market-intelligence market sync-constituents
     market-intelligence market sync-prices [--symbols NVDA,MU] [--start YYYY-MM-DD]
     market-intelligence market compute-returns [--benchmark SPY] [--method market_model]
+    market-intelligence signals build-dataset [--subtypes P,S] [--horizons 1,5,20]
     market-intelligence validate
     market-intelligence reconcile [--no-verify-hashes]
     market-intelligence status
@@ -40,6 +41,7 @@ from market_intelligence.collectors import returns as returns_collector
 from market_intelligence.collectors import sec as sec_collector
 from market_intelligence.config import Config, ConfigError, get_config
 from market_intelligence.logging_config import configure_logging, get_logger
+from market_intelligence.signals import dataset as dataset_builder
 
 app = typer.Typer(
     help="Local market-intelligence data platform (baseline).",
@@ -51,9 +53,11 @@ fred_app = typer.Typer(help="FRED economic-data collection.", no_args_is_help=Tr
 market_app = typer.Typer(
     help="Index membership, prices, and derived returns.", no_args_is_help=True
 )
+signals_app = typer.Typer(help="Event-study datasets and measured effects.", no_args_is_help=True)
 app.add_typer(sec_app, name="sec")
 app.add_typer(fred_app, name="fred")
 app.add_typer(market_app, name="market")
+app.add_typer(signals_app, name="signals")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -564,6 +568,46 @@ def market_compute_returns(
             symbols=_split_csv(symbols),
             benchmark=benchmark,
             method=chosen,
+        )
+    )
+
+
+@signals_app.command("build-dataset")
+def signals_build_dataset(
+    event_types: str | None = typer.Option(
+        None, "--event-types", help="Comma-separated event types; default = all."
+    ),
+    subtypes: str | None = typer.Option(
+        None, "--subtypes", help="Comma-separated event subtypes, e.g. P,S for insider trades."
+    ),
+    horizons: str = typer.Option(
+        "1,5,20", "--horizons", help="Comma-separated trading-day horizons."
+    ),
+    split_date: datetime = typer.Option(
+        dataset_builder.DEFAULT_SPLIT_DATE.isoformat(),
+        "--split-date",
+        formats=["%Y-%m-%d"],
+        help="Chronological discovery/holdout boundary.",
+    ),
+) -> None:
+    """Join events to forward abnormal returns. Reads stored data; fetches nothing."""
+    config = _load()
+    try:
+        parsed_horizons = tuple(int(h) for h in (_split_csv(horizons) or []))
+    except ValueError as exc:
+        err_console.print(f"[red]--horizons must be integers, got[/red] {horizons!r}")
+        raise typer.Exit(code=2) from exc
+    if not parsed_horizons or any(h < 1 for h in parsed_horizons):
+        err_console.print("[red]--horizons must be one or more positive integers.[/red]")
+        raise typer.Exit(code=2)
+
+    _run(
+        lambda: dataset_builder.build(
+            config,
+            event_types=_split_csv(event_types),
+            subtypes=_split_csv(subtypes),
+            horizons=parsed_horizons,
+            split_date=split_date.date(),
         )
     )
 

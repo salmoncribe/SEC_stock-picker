@@ -23,6 +23,7 @@ TABLES: tuple[str, ...] = (
     "daily_prices",
     "daily_returns",
     "events",
+    "event_samples",
     "pipeline_runs",
 )
 
@@ -284,6 +285,47 @@ SCHEMA_STATEMENTS: dict[str, str] = {
             validation_errors     TEXT,
             collected_time        TIMESTAMPTZ,
             UNIQUE (event_type, event_key)
+        )
+    """,
+    # One (event, target company, horizon) observation: what happened to the
+    # target over the N trading days after the event became actionable.
+    #
+    # This is the single contract every statistic downstream is computed from,
+    # so it stores the *derivation* alongside the answer: `available_on` (when
+    # the public could know), `t0` (the first tradeable day after that), and
+    # `window_end`. Keeping all three means a stored row can be re-derived and
+    # audited for leakage rather than trusted.
+    #
+    # `edge_id` is 'self' for a single-company event such as an insider trade,
+    # and a graph edge id once propagation events arrive -- so the same table
+    # serves the positive control and the real hypothesis without a second
+    # schema.
+    "event_samples": """
+        CREATE TABLE IF NOT EXISTS event_samples (
+            sample_id               TEXT PRIMARY KEY,
+            event_id                TEXT NOT NULL,
+            edge_id                 TEXT NOT NULL,
+            event_type              TEXT,
+            event_subtype           TEXT,
+            source_ticker           TEXT,
+            target_ticker           TEXT,
+            horizon_days            INTEGER NOT NULL,
+            available_on            DATE,
+            t0                      DATE,
+            window_end              DATE,
+            forward_abnormal_return DOUBLE,
+            magnitude               DOUBLE,
+            direction               INTEGER,
+            split                   TEXT,
+            features                TEXT,
+            source                  TEXT,
+            source_url              TEXT,
+            content_hash            TEXT,
+            schema_version          TEXT,
+            validation_status       TEXT,
+            validation_errors       TEXT,
+            collected_time          TIMESTAMPTZ,
+            UNIQUE (event_id, edge_id, horizon_days)
         )
     """,
     "pipeline_runs": """

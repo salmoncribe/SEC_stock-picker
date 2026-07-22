@@ -305,6 +305,25 @@ def upsert_daily_returns(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) ->
     )
 
 
+SAMPLE_COLUMNS: tuple[str, ...] = (
+    "sample_id", "event_id", "edge_id", "event_type", "event_subtype",
+    "source_ticker", "target_ticker", "horizon_days", "available_on", "t0",
+    "window_end", "forward_abnormal_return", "magnitude", "direction", "split",
+    "features", "source", "source_url", "content_hash", "schema_version",
+    "validation_status", "validation_errors", "collected_time",
+)  # fmt: skip
+
+
+def upsert_event_samples(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
+    return upsert(
+        con,
+        "event_samples",
+        rows,
+        key_cols=["event_id", "edge_id", "horizon_days"],
+        columns=SAMPLE_COLUMNS,
+    )
+
+
 def upsert_events(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
     """Upsert typed events, keyed on ``(event_type, event_key)``.
 

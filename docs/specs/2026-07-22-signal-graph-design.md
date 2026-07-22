@@ -186,8 +186,12 @@ Mirrors the existing offline discipline — no test touches the network or real 
   `confirmation_count` increments without creating new edges.
 - **Bitemporal tests** assert `graph_as_of(D)` returns edges retired after D and excludes
   edges first seen after D.
-- **A deliberately null signal** (random events joined to random edges) must produce an
-  unadmitted cell. If noise passes the gate, the gate is broken.
+- **Two controls, not one.** A deliberately null signal (random events joined to random
+  edges) must produce an unadmitted cell — if noise passes the gate, the gate is broken.
+  And a known-real signal (Form 4 insider purchases) must produce an admitted one — if a
+  documented effect fails the gate, the gate is equally broken, just in the direction that
+  looks like rigour instead of like a bug. A gate that only has the null control cannot
+  distinguish "correctly sceptical" from "detects nothing at all".
 
 ## 9. Build order
 
@@ -195,12 +199,45 @@ Stages are sequential; each ships working and testable before the next begins.
 
 | Stage | Deliverable | Gate to proceed |
 |---|---|---|
-| 0 | Price spine + PIT constituents + abnormal returns | Returns reproduce a known benchmark within tolerance |
-| 1 | Event + edge extraction into candidate tables | Extraction idempotent; spot-check accuracy on 20 filings |
+| 0 | Price spine + PIT constituents + abnormal returns | **Done 2026-07-22.** 1.55M price rows, 1.55M returns, 900 PIT membership windows, zero lookahead violations |
+| 1a | **Form 4 insider events** (structured XML, no LLM) | Extraction idempotent; event count reconciles against `filings` |
+| 1b | 8-K item-code events (structured metadata, no LLM) | Item codes parsed for every 8-K in the universe |
+| 1c | 10-K/10-Q documents + LLM edge extraction | Spot-check edge accuracy on 20 filings |
 | 2 | Dataset builder | Leakage tests pass |
-| 3 | Validation gate | Null-signal control is correctly rejected |
+| 3 | Validation gate | **Both** controls behave: null signal rejected, Form 4 detected |
 | 4 | Graph lifecycle | Dedup + bitemporal tests pass |
 | 5 | Obsidian projection + alerts | Vault regenerates from empty; alerts cite sources |
+
+### Why Form 4 comes before LLM extraction
+
+The universe-wide filing collection (2026-07-22) returned 684,301 filings, and
+the mix argues for reordering what Stage 1 builds first:
+
+| Form | Count | CIKs | Structured? | Storage |
+|---|---|---|---|---|
+| 4 (insider) | 344,392 | 627 | **XML, no LLM** | ~3 GB |
+| 8-K | 73,249 | 626 | **item codes, no LLM** | ~10 GB |
+| 10-Q | 17,112 | 623 | prose, needs LLM | ~35 GB |
+| 10-K | 5,780 | 623 | prose, needs LLM | ~12 GB |
+
+Form 4 yields roughly 60x the events of 10-K at a fifteenth of the storage and
+no inference cost. That alone would justify doing it first under the decision
+rule, but the decisive reason is different:
+
+**Form 4 is the positive control this design was missing.** Section 8 already
+requires a null-signal control — random events joined to random edges must fail
+the gate. That proves the gate can reject noise. It does not prove the gate can
+*detect* anything, and a gate that rejects everything passes it just as well.
+
+Insider trading is a well-documented return predictor with exact transaction
+and filing dates. If the harness cannot recover it, the harness is broken — a
+bad point-in-time join, a mis-signed return, a horizon off by one — and the
+finding is about the code, not the market. Without that check, a weak
+propagation result at Stage 3 is unattributable: "no effect exists" and "my
+join is wrong" look identical.
+
+So Stage 3's gate must satisfy **both** controls before any propagation result
+from it is believed.
 
 ## 10. Risks
 

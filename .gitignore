@@ -1,0 +1,41 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ---- uv ----
+# Lockfile IS committed; the environment is not.
+# uv.lock  <- intentionally tracked
+
+# ---- Environment / secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- Local data (never commit downloaded data or the DB) ----
+data/raw/**
+data/normalized/**
+data/parquet/**
+data/database/**
+!data/raw/.gitkeep
+!data/normalized/.gitkeep
+!data/parquet/.gitkeep
+!data/database/.gitkeep
+
+# ---- Logs ----
+logs/*.log
+logs/**/*.log
+
+# ---- OS / editor ----
+.DS_Store
+.idea/
+.vscode/
+*.swp

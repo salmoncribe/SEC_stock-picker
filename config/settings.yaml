@@ -1,0 +1,45 @@
+# Application settings. Values here are defaults; secrets live in .env.
+# Loaded and validated by market_intelligence.config.
+
+app:
+  name: market-intelligence
+  schema_version: "1.0.0"
+
+# HTTP request behaviour, shared by all API clients.
+http:
+  timeout_seconds: 30.0
+  connect_timeout_seconds: 10.0
+  # Max in-flight is 1 (clients are synchronous); pacing is enforced per source below.
+
+# Retry behaviour (tenacity exponential backoff). Applies to network errors,
+# HTTP 429, and 5xx responses. 429 responses additionally honour Retry-After.
+retry:
+  max_attempts: 5
+  initial_backoff_seconds: 1.0
+  max_backoff_seconds: 30.0
+  backoff_multiplier: 2.0
+  jitter_seconds: 0.5
+
+# Per-source polite request pacing (a hard floor on the interval between requests).
+# SEC EDGAR fair-access guidance is <=10 req/s; we stay well under it by default.
+pacing:
+  sec:
+    requests_per_second: 5.0
+  fred:
+    requests_per_second: 8.0
+
+sec:
+  base_url: "https://www.sec.gov"
+  data_base_url: "https://data.sec.gov"
+  # company_tickers.json -> ticker/CIK map
+  company_tickers_path: "/files/company_tickers.json"
+  # submissions API: /submissions/CIK##########.json (10-digit zero-padded)
+  submissions_path_template: "/submissions/CIK{cik10}.json"
+  # Company Facts / XBRL (baseline: client method stub + documented extension point)
+  company_facts_path_template: "/api/xbrl/companyfacts/CIK{cik10}.json"
+
+fred:
+  base_url: "https://api.stlouisfed.org"
+  series_observations_path: "/fred/series/observations"
+  series_path: "/fred/series"
+  file_type: "json"

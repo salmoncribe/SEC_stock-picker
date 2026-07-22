@@ -53,6 +53,9 @@ _VALIDATED_TABLES = (
     "filing_sections",
     "economic_series",
     "economic_observations",
+    "index_constituents",
+    "daily_prices",
+    "daily_returns",
 )
 
 

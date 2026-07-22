@@ -215,6 +215,34 @@ def _available_time(row: dict[str, Any]) -> datetime | None:
     return _as_utc(row.get("acceptance_time")) or _as_utc(row.get("filing_date"))
 
 
+def _event_time(row: dict[str, Any], available: datetime | None) -> tuple[datetime | None, bool]:
+    """When the reported event happened, never later than when it was public.
+
+    Returns ``(event_time, was_forward_dated)``.
+
+    An 8-K's report date is a bare calendar date -- "date of earliest event
+    reported" from the cover page -- while ``available_time`` is a real instant.
+    Usually the date precedes publication, as it must. But SEC dates a filing
+    accepted after 5:30pm ET to the *next business day*, and issuers routinely
+    set the report date to match that official date, so a filing that hit EDGAR
+    at 6:01pm Monday can legitimately declare Tuesday. That is a nominal date,
+    not a claim that something happened in the future.
+
+    Treating it literally would cross the two clocks and the validator would
+    reject the event -- correctly, since a midnight-UTC instant derived from a
+    nominal date is not a real occurrence time. So the event time is capped at
+    publication and the declared date is preserved in the payload. Nothing is
+    discarded, the invariant holds, and the substitution is counted rather than
+    done silently.
+    """
+    declared = _as_utc(row.get("report_date"))
+    if declared is None or available is None:
+        return (declared or available), False
+    if declared > available:
+        return available, True
+    return declared, False
+
+
 def build_events(
     row: dict[str, Any],
     item_codes: list[str],
@@ -225,10 +253,8 @@ def build_events(
     accession = str(row["accession_number"])
     available = _available_time(row)
     ticker = str(row["ticker"]).upper()
-
-    # The date of the earliest event the filing reports, which is what the 8-K
-    # cover page states; it precedes publication and must never be used as t0.
-    event_time = _as_utc(row.get("report_date")) or available
+    event_time, forward_dated = _event_time(row, available)
+    declared_report_date = row.get("report_date")
 
     records: list[EventRecord] = []
     for code in item_codes:
@@ -242,6 +268,14 @@ def build_events(
             # day without re-reading the raw store.
             "co_items": [other for other in item_codes if other != code],
             "item_count": len(item_codes),
+            # The cover-page date as filed, kept verbatim even when it was
+            # capped above, so the original is never lost.
+            "declared_report_date": (
+                declared_report_date.isoformat()
+                if isinstance(declared_report_date, date)
+                else declared_report_date
+            ),
+            "report_date_forward_dated": forward_dated,
         }
         records.append(
             EventRecord(
@@ -334,6 +368,8 @@ def sync(
                     continue
                 if record.event_subtype in BOILERPLATE_ITEMS:
                     summary.bump("boilerplate_events")
+                if record.payload.get("report_date_forward_dated"):
+                    summary.bump("forward_dated_report_date")
                 summary.collected += 1
                 pending.append(record.to_row())
 

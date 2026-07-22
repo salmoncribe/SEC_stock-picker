@@ -163,6 +163,83 @@ def test_event_time_never_follows_available_time() -> None:
         assert record.event_time <= record.available_time
 
 
+def test_after_hours_filing_forward_dated_to_the_next_day_is_capped() -> None:
+    """The real shape that rejected 631 events on the first live run.
+
+    Accession 0000074208-15-000040: accepted 18:01 ET, cover page dated the
+    next day because SEC assigns after-5:30pm filings the next business day.
+    The nominal date must not be read as an occurrence in the future.
+    """
+    (record,) = _build(
+        ["9.01"],
+        acceptance_time=datetime(2015, 6, 8, 22, 1, 16, tzinfo=UTC),
+        report_date=date(2015, 6, 9),
+        filing_date=date(2015, 6, 9),
+    )
+
+    assert record.available_time == datetime(2015, 6, 8, 22, 1, 16, tzinfo=UTC)
+    assert record.event_time == record.available_time
+    assert record.payload["report_date_forward_dated"] is True
+    # Capped for the invariant, but the filed date is still recoverable.
+    assert record.payload["declared_report_date"] == "2015-06-09"
+
+
+def test_a_normal_backdated_report_date_is_left_alone() -> None:
+    (record,) = _build(
+        ["2.02"],
+        acceptance_time=datetime(2024, 5, 6, 20, 30, tzinfo=UTC),
+        report_date=date(2024, 5, 2),
+    )
+
+    assert record.event_time == datetime(2024, 5, 2, tzinfo=UTC)
+    assert record.payload["report_date_forward_dated"] is False
+
+
+def test_forward_dated_events_are_kept_not_rejected(tmp_config: Config) -> None:
+    """The whole point: these events must survive validation and be counted."""
+    with database.connection(tmp_config.paths.database_path) as con:
+        database.init_db(con)
+        duckdb_store.upsert_companies(
+            con,
+            [
+                {
+                    "company_id": "company-1",
+                    "cik": CIK,
+                    "ticker": TICKER,
+                    "company_name": "NVIDIA Corporation",
+                    "source": "sec",
+                }
+            ],
+        )
+        duckdb_store.upsert_filings(
+            con,
+            [
+                {
+                    "filing_id": "filing-1",
+                    "company_id": "company-1",
+                    "cik": CIK,
+                    "accession_number": ACCESSION,
+                    "form": "8-K",
+                    "filing_date": date(2015, 6, 9),
+                    "report_date": date(2015, 6, 9),
+                    "acceptance_time": datetime(2015, 6, 8, 22, 1, 16, tzinfo=UTC),
+                    "validation_status": "valid",
+                    "source": "sec",
+                }
+            ],
+        )
+    _write_submissions(
+        tmp_config.paths.raw_dir,
+        _payload(accessionNumber=[ACCESSION], form=["8-K"], items=["2.02,9.01"]),
+    )
+
+    summary = filing_events.sync(tmp_config)
+
+    assert summary.rejected == 0
+    assert summary.collected == 2
+    assert summary.stage["forward_dated_report_date"] == 2
+
+
 # --------------------------------------------------------------------------- #
 # reading the preserved raw store                                              #
 # --------------------------------------------------------------------------- #

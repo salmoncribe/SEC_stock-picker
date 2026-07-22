@@ -210,6 +210,15 @@ DAILY_RETURN_COLUMNS: tuple[str, ...] = (
 )  # fmt: skip
 
 
+EVENT_COLUMNS: tuple[str, ...] = (
+    "event_id", "company_id", "cik", "ticker", "event_type", "event_subtype",
+    "event_key", "accession_number", "filing_id", "event_time", "available_time",
+    "magnitude", "direction", "payload", "extraction_method",
+    "extraction_confidence", "source", "source_url", "content_hash",
+    "schema_version", "validation_status", "validation_errors", "collected_time",
+)  # fmt: skip
+
+
 def upsert_companies(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
     return upsert(
         con,
@@ -293,6 +302,22 @@ def upsert_daily_returns(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) ->
         rows,
         key_cols=["symbol", "price_date"],
         columns=DAILY_RETURN_COLUMNS,
+    )
+
+
+def upsert_events(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
+    """Upsert typed events, keyed on ``(event_type, event_key)``.
+
+    The key excludes ``accession_number`` on purpose: one filing routinely
+    reports several transactions, so the filing alone does not identify an
+    event. ``event_key`` is the producer's per-event identifier within its type.
+    """
+    return upsert(
+        con,
+        "events",
+        rows,
+        key_cols=["event_type", "event_key"],
+        columns=EVENT_COLUMNS,
     )
 
 

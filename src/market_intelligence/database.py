@@ -22,6 +22,7 @@ TABLES: tuple[str, ...] = (
     "index_constituents",
     "daily_prices",
     "daily_returns",
+    "events",
     "pipeline_runs",
 )
 
@@ -240,6 +241,49 @@ SCHEMA_STATEMENTS: dict[str, str] = {
             validation_errors       TEXT,
             collected_time          TIMESTAMPTZ,
             UNIQUE (symbol, price_date)
+        )
+    """,
+    # One typed, timestamped thing that happened at one company.
+    #
+    # Two clocks, deliberately separate, because conflating them is the single
+    # easiest way to fabricate a backtest result:
+    #
+    #   event_time     -- when it happened in the world (e.g. the trade date on
+    #                     a Form 4). Unknowable to the market at the time.
+    #   available_time -- when the public could first have known. This is the
+    #                     only clock a feature or a label may key on.
+    #
+    # For an insider trade those differ by up to two business days, and using
+    # event_time as t=0 would be trading on information nobody had yet.
+    #
+    # `event_type` is a plain string, not an enum, so a new kind of event is a
+    # config entry and a re-run rather than a schema migration.
+    "events": """
+        CREATE TABLE IF NOT EXISTS events (
+            event_id              TEXT PRIMARY KEY,
+            company_id            TEXT,
+            cik                   TEXT,
+            ticker                TEXT,
+            event_type            TEXT NOT NULL,
+            event_subtype         TEXT,
+            event_key             TEXT NOT NULL,
+            accession_number      TEXT,
+            filing_id             TEXT,
+            event_time            TIMESTAMPTZ,
+            available_time        TIMESTAMPTZ,
+            magnitude             DOUBLE,
+            direction             INTEGER,
+            payload               TEXT,
+            extraction_method     TEXT,
+            extraction_confidence DOUBLE,
+            source                TEXT,
+            source_url            TEXT,
+            content_hash          TEXT,
+            schema_version        TEXT,
+            validation_status     TEXT,
+            validation_errors     TEXT,
+            collected_time        TIMESTAMPTZ,
+            UNIQUE (event_type, event_key)
         )
     """,
     "pipeline_runs": """

@@ -30,6 +30,20 @@ from itertools import pairwise
 # calendar days the observation is a gap, not a daily move.
 DEFAULT_MAX_GAP_DAYS = 7
 
+# Above this, a price pair is not a daily move -- it is two prices on different
+# scales, almost always a reverse split whose adjustment factor never landed.
+#
+# Calibrated against the collected universe rather than chosen for roundness.
+# The largest defensible single-day move in ten years of S&P 500 membership is
+# GME's 2021-01-27 squeeze at +134.8%. Above +200% there are 15 observations
+# across 4 symbols, every one of them a delisted ticker with a reverse-split
+# signature (CPWR alone shows +2,100%, +1,466%, +514% on separate days).
+#
+# The bound is deliberately asymmetric in effect: a real return can never fall
+# below -100%, since that would require a non-positive price, so only the upper
+# tail needs a plausibility ceiling.
+DEFAULT_MAX_PLAUSIBLE_MOVE = 2.0
+
 # Trailing window used to fit alpha/beta, and the minimum usable observations
 # within it. One year of trading days is the conventional estimation window;
 # below ~60 points a beta is too noisy to subtract meaningfully.
@@ -91,13 +105,28 @@ def simple_returns(
     bars: list[tuple[date, float]],
     *,
     max_gap_days: int = DEFAULT_MAX_GAP_DAYS,
+    max_plausible_move: float = DEFAULT_MAX_PLAUSIBLE_MOVE,
 ) -> list[tuple[date, float]]:
     """Convert an adjusted-close series into simple daily returns.
 
     ``bars`` is ``(date, adj_close)`` in any order; it is sorted here. Bars with
     a non-positive price are unusable (you cannot take a return against zero)
-    and are dropped, as are returns spanning more than ``max_gap_days`` calendar
-    days -- those are gaps in the series, not daily moves.
+    and are dropped.
+
+    Two kinds of price pair are dropped rather than turned into a return,
+    because in both the two prices are not comparable quantities:
+
+    * pairs spanning more than ``max_gap_days`` calendar days -- a hole in the
+      series, not a daily move;
+    * pairs implying a move above ``max_plausible_move`` -- effectively always
+      an unadjusted reverse split, where the two prices sit on different
+      scales.
+
+    Dropping the second kind here rather than filtering it downstream is what
+    keeps the damage contained. A single +2,100% artifact left in the series
+    would sit inside the next 252 days of estimation windows and corrupt every
+    beta fitted from them, so *every* subsequent day for that symbol would get
+    a wrong expected return -- not just the bad day itself.
 
     The first bar produces no return, since a return needs a prior price.
     """
@@ -107,7 +136,10 @@ def simple_returns(
     for (prev_date, prev_price), (curr_date, curr_price) in pairwise(usable):
         if (curr_date - prev_date).days > max_gap_days:
             continue
-        returns.append((curr_date, curr_price / prev_price - 1.0))
+        move = curr_price / prev_price - 1.0
+        if abs(move) > max_plausible_move:
+            continue
+        returns.append((curr_date, move))
     return returns
 
 
@@ -260,6 +292,7 @@ def cumulative_abnormal_return(
 __all__ = [
     "DEFAULT_ESTIMATION_WINDOW",
     "DEFAULT_MAX_GAP_DAYS",
+    "DEFAULT_MAX_PLAUSIBLE_MOVE",
     "DEFAULT_MIN_OBSERVATIONS",
     "AbnormalReturnMethod",
     "OLSFit",

@@ -35,6 +35,13 @@ from market_intelligence.schemas.market import (
 # warning, never a rejection, so a true move is recorded and merely annotated.
 EXTREME_DAILY_MOVE = 0.30
 
+# Above this a return is rejected outright rather than flagged. See
+# analytics.returns.DEFAULT_MAX_PLAUSIBLE_MOVE for the calibration: the largest
+# defensible single-day move in this universe is GME's 2021 squeeze at +134.8%,
+# and everything past +200% is an unadjusted reverse split. This is the backstop
+# for a row that reached storage without passing through simple_returns.
+IMPLAUSIBLE_DAILY_RETURN = 2.0
+
 # Adjusted close should not exceed raw close by a wide margin: adjustment
 # divides out dividends and splits, so adj_close <= close for any normal
 # history. A large excess suggests the two columns were mixed up.
@@ -176,8 +183,22 @@ def validate_return(record: DailyReturnRecord) -> DailyReturnRecord:
             reject=True,
         )
 
-    if record.total_return is not None and abs(record.total_return) > EXTREME_DAILY_MOVE:
-        record.add_error(f"extreme total_return {record.total_return:.1%}")
+    if record.total_return is not None:
+        if record.total_return <= -1.0:
+            # Below -100% requires a non-positive price, which validate_price
+            # already rejects. Reaching here means the two prices came from
+            # different series.
+            record.add_error(
+                f"total_return {record.total_return:.1%} is physically impossible", reject=True
+            )
+        elif record.total_return > IMPLAUSIBLE_DAILY_RETURN:
+            record.add_error(
+                f"total_return {record.total_return:.1%} exceeds any real single-day move; "
+                "the underlying prices are on different scales",
+                reject=True,
+            )
+        elif abs(record.total_return) > EXTREME_DAILY_MOVE:
+            record.add_error(f"extreme total_return {record.total_return:.1%}")
 
     if (
         record.abnormal_return is not None
@@ -192,6 +213,7 @@ def validate_return(record: DailyReturnRecord) -> DailyReturnRecord:
 __all__ = [
     "ADJ_CLOSE_TOLERANCE",
     "EXTREME_DAILY_MOVE",
+    "IMPLAUSIBLE_DAILY_RETURN",
     "validate_constituent",
     "validate_price",
     "validate_price_series",

@@ -70,6 +70,37 @@ def test_simple_returns_drops_non_positive_prices():
     assert result[0][1] == pytest.approx(0.20)
 
 
+def test_simple_returns_drops_an_unadjusted_reverse_split():
+    """A 22x overnight jump is two price scales, not a daily move.
+
+    Modelled on CPWR, whose real collected series shows +2,100% on a single
+    day. Left in, that observation sits inside the next 252 days of estimation
+    windows and corrupts every beta fitted from them.
+    """
+    bars = [(days(0), 1.0), (days(1), 22.0), (days(2), 23.0)]
+
+    result = simple_returns(bars)
+
+    assert [d for d, _ in result] == [days(2)]
+
+
+def test_simple_returns_keeps_the_largest_real_move_on_record():
+    """GME's 2021-01-27 squeeze (+134.8%) is real and must survive."""
+    bars = [(days(0), 100.0), (days(1), 234.8)]
+
+    result = simple_returns(bars)
+
+    assert len(result) == 1
+    assert result[0][1] == pytest.approx(1.348)
+
+
+def test_simple_returns_plausibility_bound_is_configurable():
+    bars = [(days(0), 100.0), (days(1), 150.0)]
+
+    assert simple_returns(bars, max_plausible_move=0.2) == []
+    assert len(simple_returns(bars, max_plausible_move=1.0)) == 1
+
+
 def test_simple_returns_needs_a_prior_price():
     assert simple_returns([(days(0), 100.0)]) == []
     assert simple_returns([]) == []

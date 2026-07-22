@@ -335,6 +335,36 @@ def test_trailing_estimation_window_passes():
     assert validate_return(record).validation_status == "valid"
 
 
+def _return(**overrides) -> DailyReturnRecord:
+    defaults = {
+        "return_id": "r1",
+        "symbol": "AAA",
+        "price_date": date(2024, 1, 10),
+    }
+    return DailyReturnRecord(**{**defaults, **overrides})
+
+
+def test_implausible_positive_return_is_rejected():
+    """+2,100% is an unadjusted reverse split, not a price move."""
+    result = validate_return(_return(total_return=21.0))
+
+    assert result.is_rejected
+    assert "different scales" in result.validation_errors[0]
+
+
+def test_impossible_negative_return_is_rejected():
+    """Below -100% requires a non-positive price."""
+    assert validate_return(_return(total_return=-1.5)).is_rejected
+
+
+def test_largest_real_move_on_record_is_kept_as_a_warning():
+    """GME's +134.8% squeeze is real: flagged, never rejected."""
+    result = validate_return(_return(total_return=1.348))
+
+    assert not result.is_rejected
+    assert result.validation_status == "warning"
+
+
 def test_market_model_without_a_beta_warns():
     record = DailyReturnRecord(
         return_id="r1",

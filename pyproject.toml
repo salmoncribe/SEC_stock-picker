@@ -24,6 +24,7 @@ dependencies = [
     "rich>=13.7",
     "beautifulsoup4>=4.12",
     "lxml>=5.2",
+    "yfinance>=0.2.40",
 ]
 
 [project.optional-dependencies]
@@ -89,7 +90,9 @@ disallow_untyped_defs = false
 ignore_missing_imports = false
 
 [[tool.mypy.overrides]]
-module = ["duckdb.*", "pyarrow.*"]
+# yfinance ships no py.typed marker or stubs; it is confined to one module
+# (clients/market_yfinance.py) behind the MarketDataProvider interface.
+module = ["duckdb.*", "pyarrow.*", "yfinance.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

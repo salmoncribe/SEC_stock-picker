@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from market_intelligence import database
 from market_intelligence.clients.market_yfinance import (
@@ -204,6 +205,49 @@ def test_start_no_older_than_stored_history_still_resumes(tmp_config: Config) ->
 
     aaa_calls = [c for c in fetcher.calls if c[0] == "AAA"]
     assert aaa_calls == [("AAA", date(2024, 1, 6), END)]
+
+
+def test_earlier_symbols_survive_a_later_symbol_crashing(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Work already done must be durable when the run dies partway through.
+
+    This is what makes resumption real. _fetch_start resumes from
+    max(price_date), so if a run buffered every symbol and wrote once at the
+    end, a crash near the finish would leave nothing stored and the next run
+    would restart from zero. The failure injected here is a bare RuntimeError
+    -- deliberately not a MarketDataUnavailable, which the collector catches --
+    so it tears the run down the way an OOM or a killed process would.
+    """
+
+    class Boom(RuntimeError):
+        pass
+
+    fetcher = StubFetcher(default=bars_frame([date(2024, 1, 2), date(2024, 1, 3)]))
+
+    # Fail on the write for ZZZ, not inside the fetch: the provider converts
+    # every fetch-path exception into MarketDataUnavailable, which the
+    # collector is supposed to absorb per symbol. The crash has to land after
+    # AAA has been handed to storage for this to test durability at all.
+    real_upsert = duckdb_store.upsert_daily_prices
+
+    def exploding_upsert(con, rows):
+        materialized = list(rows)
+        if any(row.get("symbol") == "ZZZ" for row in materialized):
+            raise Boom("killed mid-run")
+        return real_upsert(con, materialized)
+
+    monkeypatch.setattr(price_collector.duckdb_store, "upsert_daily_prices", exploding_upsert)
+
+    with pytest.raises(Boom):
+        price_collector.sync(
+            tmp_config, symbols=["AAA", "ZZZ"], end=END, provider=_provider(fetcher)
+        )
+
+    with database.connection(tmp_config.paths.database_path) as con:
+        stored = con.execute("SELECT count(*) FROM daily_prices WHERE symbol = 'AAA'").fetchone()[0]
+
+    assert stored == 2, "bars collected before the crash were lost"
 
 
 def test_no_network_work_when_already_current(tmp_config: Config) -> None:

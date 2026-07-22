@@ -134,7 +134,9 @@ def sync(
 
         collected = 0
         rejected = 0
-        price_rows: list[dict[str, Any]] = []
+        inserted = 0
+        updated = 0
+        deduped = 0
 
         for symbol in universe:
             fetch_start = _fetch_start(con, symbol, start, default_start)
@@ -184,27 +186,42 @@ def sync(
                 validate_price(record)
             validate_price_series(records)
 
+            symbol_rows: list[dict[str, Any]] = []
             for record in records:
                 collected += 1
                 if record.is_rejected:
                     rejected += 1
                 else:
-                    price_rows.append(record.to_row())
+                    symbol_rows.append(record.to_row())
+
+            # Persist per symbol rather than once at the end of the universe.
+            #
+            # Batching the whole run into a single terminal write would hold
+            # ~2M rows in memory for a full backfill, but the real cost is that
+            # it makes resumption a fiction: _fetch_start resumes from
+            # max(price_date), so a run killed at symbol 870 of 874 would have
+            # written nothing and the next run would start over from the
+            # beginning. Flushing per symbol is what makes an interrupted
+            # backfill cost one symbol instead of all of them.
+            if symbol_rows:
+                result = duckdb_store.upsert_daily_prices(con, symbol_rows)
+                inserted += result.inserted
+                updated += result.updated
+                deduped += result.deduped
+                parquet.write_records(
+                    config.paths.parquet_dir,
+                    "daily_prices",
+                    symbol_rows,
+                    ["price_id"],
+                    partition_col="symbol",
+                )
 
             summary.note(f"{symbol}: {len(records)} bars fetched from {fetch_start}")
 
-        result = duckdb_store.upsert_daily_prices(con, price_rows)
-        parquet.write_records(
-            config.paths.parquet_dir,
-            "daily_prices",
-            price_rows,
-            ["price_id"],
-            partition_col="symbol",
-        )
-
         summary.collected = collected
-        summary.inserted = result.inserted
-        summary.updated = result.updated
+        summary.inserted = inserted
+        summary.updated = updated
+        summary.deduped = deduped
         summary.rejected = rejected
 
     return summary

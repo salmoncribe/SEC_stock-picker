@@ -268,15 +268,57 @@ def sec_sync_companies() -> None:
     _run(lambda: sec_collector.sync_companies(config))
 
 
+def _priced_universe(config: Config) -> list[str]:
+    """Every ticker that was ever an index member *and* has price history.
+
+    Price history is the join condition, not an afterthought: a company with
+    filings but no prices contributes events with no label to measure them
+    against, so it adds collection cost and no signal. Membership is taken over
+    all time, not current members only -- excluding the companies that were
+    acquired or delisted is precisely the survivorship bias the point-in-time
+    universe exists to prevent.
+    """
+    with database.connection(config.paths.database_path) as con:
+        database.init_db(con)
+        rows = con.execute(
+            """
+            SELECT DISTINCT ic.ticker
+            FROM index_constituents ic
+            JOIN daily_prices p ON p.symbol = ic.ticker
+            ORDER BY ic.ticker
+            """
+        ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
 @sec_app.command("collect-filings")
 def sec_collect_filings(
     ticker: str | None = typer.Option(None, "--ticker", help="Single ticker, e.g. NVDA."),
+    universe: bool = typer.Option(
+        False, "--universe", help="Every ever-index-member ticker that has price history."
+    ),
     forms: str | None = typer.Option(None, "--forms", help="Comma-separated form types."),
     limit: int | None = typer.Option(None, "--limit", help="Max filings per ticker."),
 ) -> None:
-    """Collect filings for a ticker (or the configured companies)."""
+    """Collect filings for a ticker, the priced universe, or the configured companies."""
     config = _load()
-    tickers = [ticker] if ticker else None
+    if ticker and universe:
+        err_console.print("[red]--ticker and --universe are mutually exclusive.[/red]")
+        raise typer.Exit(code=2)
+
+    tickers: list[str] | None
+    if universe:
+        tickers = _priced_universe(config)
+        if not tickers:
+            err_console.print(
+                "[red]No priced universe found.[/red] Run 'market sync-constituents' "
+                "and 'market sync-prices' first."
+            )
+            raise typer.Exit(code=2)
+        console.print(f"Collecting filings for [bold]{len(tickers)}[/bold] tickers.")
+    else:
+        tickers = [ticker] if ticker else None
+
     _run(
         lambda: sec_collector.collect_filings(
             config, tickers=tickers, forms=_split_csv(forms), limit=limit

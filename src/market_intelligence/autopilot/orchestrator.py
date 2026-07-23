@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from market_intelligence import database
 from market_intelligence.autopilot import briefing as briefing_builder
-from market_intelligence.autopilot import notify, obsidian
+from market_intelligence.autopilot import notify, obsidian, ram_guard
 from market_intelligence.autopilot.types import Briefing, RunStatus
 from market_intelligence.collectors import filing_events as filing_events_collector
 from market_intelligence.collectors import prices as price_collector
@@ -89,6 +89,26 @@ def _ingest_counts(results: dict[str, RunSummary]) -> dict[str, int]:
     return counts
 
 
+def _check_ram(config: Config) -> list[str]:
+    """Run the RAM guard before the loop starts; fold what it did into notes.
+
+    Best-effort like every other step here: a guard that can't read the
+    machine (missing ``ps``/``memory_pressure``, a locked-down sandbox) must
+    not sink the whole daily loop over a safety check failing to run. Silent
+    otherwise -- a healthy machine with nothing to report adds no note, so the
+    briefing isn't cluttered with "everything's fine" every single day.
+    """
+    try:
+        result = ram_guard.run_guard(database_path=config.paths.database_path)
+    except Exception as exc:  # a failing safety check must not abort the loop
+        logger.error("autopilot_ram_guard_failed", error=str(exc))
+        return []
+    logger.info("autopilot_ram_guard", free_pct=result.free_pct, killed=len(result.killed))
+    if not result.killed and result.free_pct >= ram_guard.DEFAULT_ACT_BELOW_FREE_PCT:
+        return []
+    return [result.summary_line]
+
+
 def run(
     config: Config,
     *,
@@ -115,7 +135,7 @@ def run(
         before = briefing_builder.snapshot_statuses(con)
 
     results: dict[str, RunSummary] = {}
-    notes: list[str] = []
+    notes: list[str] = _check_ram(config)
     run_status = RunStatus.SUCCESS
 
     for step in plan:

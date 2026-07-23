@@ -35,6 +35,7 @@ from market_intelligence.analytics.impact import (
 from market_intelligence.analytics.returns import ReturnPoint
 from market_intelligence.collectors import RunSummary, pipeline_run
 from market_intelligence.schemas.common import Source, utcnow
+from market_intelligence.signals.promotion import LadderStatus, SignalStatus, advance
 from market_intelligence.storage import duckdb as duckdb_store
 
 if TYPE_CHECKING:
@@ -219,6 +220,82 @@ def _row(cell: ImpactCell, verdict: Verdict, reason: str, schema_version: str) -
     }
 
 
+def _load_prev_statuses(
+    con: duckdb.DuckDBPyConnection,
+) -> dict[tuple[str, str | None, str, int], dict[str, Any]]:
+    """Each cell's ladder row from the last run, keyed by the cell.
+
+    Returned as plain dicts (not :class:`SignalStatus`) because the ladder
+    transition needs only status and the two streaks, but computing the new
+    ``became_active_time`` needs the previous one -- so the whole row is carried.
+    """
+    rows = con.execute(
+        """
+        SELECT event_type, event_subtype, edge_type, horizon_days,
+               status, confirm_streak, fail_streak, became_active_time, first_seen_time
+        FROM signal_status
+        """
+    ).fetchall()
+    columns = (
+        "status", "confirm_streak", "fail_streak", "became_active_time", "first_seen_time",
+    )  # fmt: skip
+    return {
+        (str(r[0]), r[1], str(r[2]), int(r[3])): dict(zip(columns, r[4:], strict=True))
+        for r in rows
+    }
+
+
+def _status_row(
+    *,
+    cell_key: tuple[str, str | None, str, int],
+    new_status: SignalStatus,
+    prev: dict[str, Any] | None,
+    estimate: ImpactCell | None,
+    verdict: Verdict,
+    reason: str,
+    now: Any,
+    schema_version: str,
+) -> dict[str, Any]:
+    """Build one ``signal_status`` row for a cell after its status advanced.
+
+    ``became_active_time`` is stamped once, on the run that first turns the cell
+    active, and carried forward on every later run so it always marks the moment
+    trust was first earned. ``estimate`` supplies the cell's current measured
+    behaviour (mean, hit rate, direction) so an alert can quote it without
+    re-reading the samples.
+    """
+    event_type, subtype, edge_type, horizon = cell_key
+
+    if new_status.status is LadderStatus.ACTIVE:
+        was_active = prev is not None and prev.get("status") == LadderStatus.ACTIVE.value
+        became_active_time = prev.get("became_active_time") if was_active and prev else now
+    else:
+        became_active_time = None
+
+    first_seen_time = prev.get("first_seen_time") if prev else now
+
+    return {
+        "signal_id": hashing.content_hash("signal", event_type, subtype, edge_type, horizon),
+        "event_type": event_type,
+        "event_subtype": subtype,
+        "edge_type": edge_type,
+        "horizon_days": horizon,
+        "status": new_status.status.value,
+        "confirm_streak": new_status.confirm_streak,
+        "fail_streak": new_status.fail_streak,
+        "last_verdict": verdict.value,
+        "last_reason": reason,
+        "mean_car": estimate.mean_car if estimate else None,
+        "hit_rate": estimate.hit_rate if estimate else None,
+        "n_clusters": estimate.n_clusters if estimate else None,
+        "direction": estimate.direction if estimate else None,
+        "first_seen_time": first_seen_time,
+        "became_active_time": became_active_time,
+        "last_evaluated_time": now,
+        "schema_version": schema_version,
+    }
+
+
 def evaluate(
     config: Config,
     *,
@@ -227,13 +304,17 @@ def evaluate(
     placebo_size: int = 5000,
     placebo_seed: int = 20260722,
 ) -> RunSummary:
-    """Measure every cell and record which may fire alerts."""
+    """Measure every cell, advance the promotion ladder, and record verdicts."""
     limits = thresholds or AdmissionThresholds()
+    ladder = config.settings.autopilot
 
     with pipeline_run(config, "signals.impact") as (con, summary):
         schema_version = config.settings.app.schema_version
         rows: list[dict[str, Any]] = []
+        status_rows: list[dict[str, Any]] = []
         verdict_counts: dict[str, int] = {}
+        prev_statuses = _load_prev_statuses(con)
+        now = utcnow()
 
         for event_type, subtype, edge_type, horizon in _load_cell_keys(con):
             splits = {
@@ -254,6 +335,42 @@ def evaluate(
             for cell in splits.values():
                 if cell is not None:
                     rows.append(_row(cell, verdict, reason, schema_version))
+
+            # Advance the promotion ladder for this cell. The transition is a
+            # pure function of the previous status and this run's verdict; only
+            # a tracked cell (one that has at least once cleared discovery) gets
+            # a row, so untracked rejections do not litter the table.
+            cell_key = (event_type, subtype, edge_type, horizon)
+            prev = prev_statuses.get(cell_key)
+            prev_status = (
+                SignalStatus(
+                    status=LadderStatus(prev["status"]),
+                    confirm_streak=int(prev["confirm_streak"]),
+                    fail_streak=int(prev["fail_streak"]),
+                )
+                if prev
+                else None
+            )
+            new_status = advance(
+                prev_status,
+                verdict,
+                reason,
+                promotion_streak=ladder.promotion_streak,
+                retire_after=ladder.retire_after,
+            )
+            if new_status is not None:
+                status_rows.append(
+                    _status_row(
+                        cell_key=cell_key,
+                        new_status=new_status,
+                        prev=prev,
+                        estimate=splits[DISCOVERY] or splits[HOLDOUT],
+                        verdict=verdict,
+                        reason=reason,
+                        now=now,
+                        schema_version=schema_version,
+                    )
+                )
 
             summary.note(
                 f"{event_type}/{subtype or '-'}/{edge_type}/{horizon}d: {verdict.value} — {reason}"
@@ -298,6 +415,12 @@ def evaluate(
         summary.updated = result.updated
         for name, count in sorted(verdict_counts.items()):
             summary.bump(name, count)
+
+        status_result = duckdb_store.upsert_signal_status(con, status_rows)
+        summary.bump("signals_tracked", len(status_rows))
+        summary.bump("signals_new", status_result.inserted)
+        for row in status_rows:
+            summary.bump(f"ladder_{row['status']}")
 
     return summary
 

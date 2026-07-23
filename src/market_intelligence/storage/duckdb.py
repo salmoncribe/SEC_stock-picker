@@ -333,6 +333,34 @@ def upsert_impact_stats(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> 
     )
 
 
+SIGNAL_STATUS_COLUMNS: tuple[str, ...] = (
+    "signal_id", "event_type", "event_subtype", "edge_type", "horizon_days",
+    "status", "confirm_streak", "fail_streak", "last_verdict", "last_reason",
+    "mean_car", "hit_rate", "n_clusters", "direction", "first_seen_time",
+    "became_active_time", "last_evaluated_time", "schema_version",
+)  # fmt: skip
+
+
+def upsert_signal_status(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
+    """Upsert a cell's ladder position, keyed on the cell (not the split).
+
+    ``first_seen_time`` is immutable on update -- it records when a cell was
+    first tracked and must survive every later run's clock. ``became_active_time``
+    is deliberately *not* immutable here: a cell is first inserted as a candidate
+    with no activation time, so the value has to be settable later, on the run
+    that promotes it. The caller computes it (set once on the transition into
+    active, carried forward thereafter) so the upsert can write it plainly.
+    """
+    return upsert(
+        con,
+        "signal_status",
+        rows,
+        key_cols=["event_type", "event_subtype", "edge_type", "horizon_days"],
+        columns=SIGNAL_STATUS_COLUMNS,
+        immutable_on_update=["first_seen_time"],
+    )
+
+
 def upsert_event_samples(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
     return upsert(
         con,

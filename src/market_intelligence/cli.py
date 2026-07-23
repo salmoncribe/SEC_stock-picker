@@ -15,6 +15,7 @@ Commands::
     market-intelligence market compute-returns [--benchmark SPY] [--method market_model]
     market-intelligence signals build-dataset [--subtypes P,S] [--horizons 1,5,20]
     market-intelligence signals evaluate [--no-placebo]
+    market-intelligence autopilot run
     market-intelligence validate
     market-intelligence reconcile [--no-verify-hashes]
     market-intelligence status
@@ -34,6 +35,8 @@ from rich.table import Table
 from market_intelligence import __version__, database, reconciliation
 from market_intelligence.analytics.impact import AdmissionThresholds
 from market_intelligence.analytics.returns import AbnormalReturnMethod
+from market_intelligence.autopilot import orchestrator as autopilot
+from market_intelligence.autopilot.types import RunStatus
 from market_intelligence.collectors import RunSummary
 from market_intelligence.collectors import constituents as constituents_collector
 from market_intelligence.collectors import documents as document_collector
@@ -59,10 +62,12 @@ market_app = typer.Typer(
     help="Index membership, prices, and derived returns.", no_args_is_help=True
 )
 signals_app = typer.Typer(help="Event-study datasets and measured effects.", no_args_is_help=True)
+autopilot_app = typer.Typer(help="The self-checking daily loop.", no_args_is_help=True)
 app.add_typer(sec_app, name="sec")
 app.add_typer(fred_app, name="fred")
 app.add_typer(market_app, name="market")
 app.add_typer(signals_app, name="signals")
+app.add_typer(autopilot_app, name="autopilot")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -440,6 +445,31 @@ def sec_sync_filing_events(
             config, forms=_split_csv_tuple(forms), tickers=tickers, limit=limit
         )
     )
+
+
+@autopilot_app.command("run")
+def autopilot_run() -> None:
+    """Run the daily loop: refresh data, mature samples, re-gate, and brief.
+
+    Sequences the pipeline, advances the promotion ladder, writes the Obsidian
+    briefing note, and pushes the Telegram nudge. Designed to run unattended
+    from launchd; a failed step degrades the run rather than aborting it, and a
+    briefing is always produced. Exit code is non-zero only when the run failed
+    outright (the gate itself could not run).
+    """
+    config = _load()
+    briefing = autopilot.run(config)
+
+    active = sum(1 for s in briefing.active_signals)
+    console.print(
+        f"[bold]Autopilot {briefing.run_status}[/bold] for {briefing.as_of}: "
+        f"{len(briefing.changes)} change(s), {len(briefing.alerts)} alert(s), "
+        f"{active} active signal(s)."
+    )
+    for note in briefing.notes:
+        err_console.print(f"[yellow]{note}[/yellow]")
+    if briefing.run_status == RunStatus.FAILED:
+        raise typer.Exit(code=1)
 
 
 @app.command()

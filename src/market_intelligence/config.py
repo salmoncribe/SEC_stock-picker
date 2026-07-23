@@ -39,6 +39,9 @@ class EnvSettings(BaseSettings):
     fred_api_key: str | None = None
     market_intelligence_home: str | None = None
     log_level: str = "INFO"
+    # Autopilot notification secrets, shared with the existing Telegram bot.
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -86,11 +89,29 @@ class FredConfig(BaseModel):
     file_type: str = "json"
 
 
+class AutopilotConfig(BaseModel):
+    """Tuning for the self-checking loop and the promotion ladder.
+
+    ``discovery_boundary`` freezes the discovery/holdout split so re-running the
+    gate cannot mint new admissions from a growing pool; new data only ever
+    grows holdout. ``promotion_streak`` (K) is how many consecutive holdout
+    confirmations a cell needs before it is trusted to fire alerts.
+    ``retire_after`` is how many consecutive failing runs retire a dormant cell.
+    """
+
+    enabled: bool = True
+    discovery_boundary: str = "2023-01-01"
+    promotion_streak: int = Field(default=2, ge=1)
+    retire_after: int = Field(default=3, ge=1)
+    obsidian_vault_subdir: str = "obsidian"
+
+
 class SettingsFile(BaseModel):
     app: AppInfo = AppInfo()
     http: HttpConfig = HttpConfig()
     retry: RetryConfig = RetryConfig()
     pacing: PacingConfig = PacingConfig()
+    autopilot: AutopilotConfig = AutopilotConfig()
     sec: SecConfig
     fred: FredConfig
 
@@ -162,6 +183,7 @@ class Paths(BaseModel):
     database_path: Path
     logs_dir: Path
     log_file: Path
+    obsidian_vault_dir: Path
 
     def ensure(self) -> Paths:
         """Create every data/log directory if missing. Safe to call repeatedly."""
@@ -172,6 +194,7 @@ class Paths(BaseModel):
             self.parquet_dir,
             self.database_dir,
             self.logs_dir,
+            self.obsidian_vault_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
         return self
@@ -263,7 +286,7 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
-def _build_paths(home: Path, project_root: Path) -> Paths:
+def _build_paths(home: Path, project_root: Path, vault_subdir: str) -> Paths:
     data_dir = home / "data"
     database_dir = data_dir / "database"
     logs_dir = home / "logs"
@@ -279,6 +302,7 @@ def _build_paths(home: Path, project_root: Path) -> Paths:
         database_path=database_dir / "market_intelligence.duckdb",
         logs_dir=logs_dir,
         log_file=logs_dir / "market_intelligence.log",
+        obsidian_vault_dir=home / vault_subdir,
     )
 
 
@@ -310,7 +334,7 @@ def load_config(
         fred_series=fred_series,
         companies=companies,
         forms=forms,
-        paths=_build_paths(resolved_home, root),
+        paths=_build_paths(resolved_home, root, settings.autopilot.obsidian_vault_subdir),
     )
 
 

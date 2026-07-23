@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Autopilot: the self-checking daily loop.
+
+  Runs `market-intelligence autopilot run` every morning at 06:00 local time.
+  Contains NO secrets: the app loads `.env` (git-ignored) itself, which is where
+  MARKET_INTELLIGENCE_HOME and the optional TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+  live. A missing Telegram token just skips the nudge; the Obsidian note is
+  written regardless.
+
+  Install:
+    cp config/launchd/ai.quant.autopilot.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/ai.quant.autopilot.plist
+  Run once now to test:
+    launchctl start ai.quant.autopilot
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/ai.quant.autopilot.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.quant.autopilot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>cd /Users/michaeltadlock/quant &amp;&amp; /opt/homebrew/bin/uv run market-intelligence autopilot run</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- If the mini was asleep at 06:00, run as soon as it wakes. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/michaeltadlock/quant/logs/autopilot.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/michaeltadlock/quant/logs/autopilot.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -25,6 +25,7 @@ TABLES: tuple[str, ...] = (
     "events",
     "event_samples",
     "impact_stats",
+    "signal_status",
     "pipeline_runs",
 )
 
@@ -366,6 +367,29 @@ SCHEMA_STATEMENTS: dict[str, str] = {
             validation_errors TEXT,
             collected_time    TIMESTAMPTZ,
             UNIQUE (event_type, event_subtype, edge_type, horizon_days, split)
+        )
+    """,
+    "signal_status": """
+        CREATE TABLE IF NOT EXISTS signal_status (
+            signal_id           TEXT PRIMARY KEY,
+            event_type          TEXT NOT NULL,
+            event_subtype       TEXT,
+            edge_type           TEXT NOT NULL,
+            horizon_days        INTEGER NOT NULL,
+            status              TEXT NOT NULL,
+            confirm_streak      INTEGER NOT NULL,
+            fail_streak         INTEGER NOT NULL,
+            last_verdict        TEXT,
+            last_reason         TEXT,
+            mean_car            DOUBLE,
+            hit_rate            DOUBLE,
+            n_clusters          INTEGER,
+            direction           INTEGER,
+            first_seen_time     TIMESTAMPTZ,
+            became_active_time  TIMESTAMPTZ,
+            last_evaluated_time TIMESTAMPTZ,
+            schema_version      TEXT,
+            UNIQUE (event_type, event_subtype, edge_type, horizon_days)
         )
     """,
     "pipeline_runs": """

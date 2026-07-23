@@ -226,4 +226,133 @@ def build(
     return summary
 
 
-__all__ = ["DEFAULT_HORIZONS", "DEFAULT_SPLIT_DATE", "build"]
+def _validatable_edges(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str, str]]:
+    """Resolved edges whose both ends have a return series, grouped-ready.
+
+    Returns ``(source_ticker, target_ticker, edge_type)``. Only resolved edges
+    with a real target and a source distinct from the target can be measured --
+    the same is-validatable test the collector records, re-checked here against
+    the return series so a target with no prices is never queued.
+    """
+    rows = con.execute(
+        """
+        SELECT DISTINCT e.source_ticker, e.target_ticker, e.edge_type
+        FROM company_edges e
+        WHERE e.resolution_status = 'resolved'
+          AND e.target_ticker IS NOT NULL AND e.target_ticker <> ''
+          AND e.source_ticker IS NOT NULL AND e.source_ticker <> ''
+          AND e.source_ticker <> e.target_ticker
+          AND EXISTS (SELECT 1 FROM daily_returns r WHERE r.symbol = e.source_ticker)
+          AND EXISTS (SELECT 1 FROM daily_returns r WHERE r.symbol = e.target_ticker)
+        ORDER BY e.target_ticker, e.source_ticker, e.edge_type
+        """
+    ).fetchall()
+    return [(str(r[0]), str(r[1]), str(r[2])) for r in rows]
+
+
+def build_propagation(
+    config: Config,
+    *,
+    event_types: list[str] | None = None,
+    subtypes: list[str] | None = None,
+    horizons: tuple[int, ...] = DEFAULT_HORIZONS,
+    split_date: date = DEFAULT_SPLIT_DATE,
+) -> RunSummary:
+    """Build propagation samples: an event at the source, the target's return.
+
+    For every validatable edge, each of the *source's* events is scored against
+    the *target's* forward return, with ``edge_id`` set to the relationship type.
+    Those samples land in the same ``event_samples`` table the self-control uses,
+    so the gate and the promotion ladder judge propagation cells (e.g.
+    ``insider_transaction/P/customer/20d``) with no additional machinery.
+
+    Indexed by target: each target's return series is built once and reused for
+    every edge pointing into it, and rows flush per target so an interrupted
+    build keeps what it finished.
+    """
+    with pipeline_run(config, "signals.dataset.propagation") as (con, summary):
+        schema_version = config.settings.app.schema_version
+        edges = _validatable_edges(con)
+        by_target: dict[str, list[tuple[str, str]]] = {}
+        for source, target, edge_type in edges:
+            by_target.setdefault(target, []).append((source, edge_type))
+        summary.note(f"{len(edges)} validatable edges into {len(by_target)} targets")
+
+        collected = inserted = updated = unmeasurable = purged = 0
+
+        for target, incoming in by_target.items():
+            points = _load_returns(con, target)
+            if not points:
+                continue
+            returns = ReturnSeries(points)
+
+            rows: list[dict[str, Any]] = []
+            for source, edge_type in incoming:
+                for (
+                    event_id,
+                    etype,
+                    subtype,
+                    available_time,
+                    magnitude,
+                    direction,
+                ) in _events_for_symbol(con, source, event_types, subtypes):
+                    available_on = available_time.date()
+                    for horizon in horizons:
+                        collected += 1
+                        window = returns.forward(available_on, horizon)
+                        if window is None:
+                            unmeasurable += 1
+                            continue
+                        split = assign_split(window, split_date)
+                        if split is None:
+                            purged += 1
+                            continue
+
+                        record = EventSampleRecord(
+                            # Target is in the id: one source event points at
+                            # several targets, each a distinct sample.
+                            sample_id=hashing.content_hash(
+                                "prop", event_id, edge_type, target, horizon
+                            ),
+                            event_id=event_id,
+                            edge_id=edge_type,
+                            event_type=etype,
+                            event_subtype=subtype,
+                            source_ticker=source,
+                            target_ticker=target,
+                            horizon_days=horizon,
+                            available_on=available_on,
+                            t0=window.t0,
+                            window_end=window.window_end,
+                            forward_abnormal_return=window.cumulative_abnormal_return,
+                            magnitude=magnitude,
+                            direction=direction,
+                            split=split.value,
+                            features={"edge_type": edge_type, "source": source},
+                            schema_version=schema_version,
+                            collected_time=utcnow(),
+                        )
+                        rows.append(record.to_row())
+
+            if rows:
+                result = duckdb_store.upsert_event_samples(con, rows)
+                inserted += result.inserted
+                updated += result.updated
+                parquet.write_records(
+                    config.paths.parquet_dir,
+                    "event_samples",
+                    rows,
+                    ["sample_id"],
+                    partition_col="event_type",
+                )
+
+        summary.collected = collected
+        summary.inserted = inserted
+        summary.updated = updated
+        summary.bump("unmeasurable", unmeasurable)
+        summary.bump("purged_at_split", purged)
+        summary.bump("edges", len(edges))
+    return summary
+
+
+__all__ = ["DEFAULT_HORIZONS", "DEFAULT_SPLIT_DATE", "build", "build_propagation"]

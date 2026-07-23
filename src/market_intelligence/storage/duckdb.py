@@ -393,11 +393,16 @@ def upsert_signal_status(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) ->
 
 
 def upsert_event_samples(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
+    # ``target_ticker`` is part of the key because propagation fans one event out
+    # to several targets under the same edge type: an insider buy at NKE scores
+    # both ONON and LULU as "competitor" at the same horizon, and those are
+    # distinct observations, not the same row overwritten. For a self edge the
+    # target equals the source, so this changes nothing.
     return upsert(
         con,
         "event_samples",
         rows,
-        key_cols=["event_id", "edge_id", "horizon_days"],
+        key_cols=["event_id", "edge_id", "horizon_days", "target_ticker"],
         columns=SAMPLE_COLUMNS,
     )
 

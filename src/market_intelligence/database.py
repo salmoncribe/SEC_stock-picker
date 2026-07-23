@@ -328,7 +328,7 @@ SCHEMA_STATEMENTS: dict[str, str] = {
             validation_status       TEXT,
             validation_errors       TEXT,
             collected_time          TIMESTAMPTZ,
-            UNIQUE (event_id, edge_id, horizon_days)
+            UNIQUE (event_id, edge_id, horizon_days, target_ticker)
         )
     """,
     # Measured behaviour of one (event kind, edge kind, horizon) combination on

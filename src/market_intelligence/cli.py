@@ -37,8 +37,8 @@ from rich.table import Table
 from market_intelligence import __version__, database, reconciliation
 from market_intelligence.analytics.impact import AdmissionThresholds
 from market_intelligence.analytics.returns import AbnormalReturnMethod
+from market_intelligence.autopilot import graph, ram_guard
 from market_intelligence.autopilot import orchestrator as autopilot
-from market_intelligence.autopilot import ram_guard
 from market_intelligence.autopilot.types import RunStatus
 from market_intelligence.collectors import RunSummary
 from market_intelligence.collectors import constituents as constituents_collector
@@ -750,6 +750,34 @@ def signals_evaluate(
     _run(lambda: impact_gate.evaluate(config, thresholds=thresholds, with_placebo=placebo))
 
 
+@signals_app.command("build-propagation")
+def signals_build_propagation(
+    event_types: str | None = typer.Option(
+        None, "--event-types", help="Comma-separated event types; default = all."
+    ),
+    subtypes: str | None = typer.Option(
+        None, "--subtypes", help="Comma-separated event subtypes, e.g. P,S."
+    ),
+    horizons: str = typer.Option("1,5,20", "--horizons", help="Trading-day horizons."),
+) -> None:
+    """Build propagation samples from the relationship graph.
+
+    For every validatable edge, scores the source's events against the target's
+    forward returns into ``event_samples`` with the relationship type as the
+    edge. Then ``signals evaluate`` judges the propagation cells alongside the
+    self-control, through the same gate and promotion ladder.
+    """
+    config = _load()
+    _run(
+        lambda: dataset_builder.build_propagation(
+            config,
+            event_types=_split_csv(event_types),
+            subtypes=_split_csv(subtypes),
+            horizons=tuple(int(h) for h in horizons.split(",") if h.strip()),
+        )
+    )
+
+
 @signals_app.command("extract-relationships")
 def signals_extract_relationships(
     ticker: str | None = typer.Option(None, "--ticker", help="Restrict to a single ticker."),
@@ -785,6 +813,24 @@ def signals_extract_relationships(
             priced_only=priced_only,
             latest_only=latest_only,
         )
+    )
+
+
+@signals_app.command("project-graph")
+def signals_project_graph() -> None:
+    """Regenerate the Obsidian relationship-graph vault from ``company_edges``.
+
+    Writes one interlinked note per company into the vault, so the graph is
+    navigable in Obsidian's graph view. The vault is a projection of the
+    database and is overwritten each run -- the database is the source of truth.
+    """
+    config = _load()
+    config.paths.ensure()
+    with database.connection(config.paths.database_path) as con:
+        database.init_db(con)
+        written = graph.project_graph(con, config.paths.obsidian_vault_dir)
+    console.print(
+        f"[green]Wrote[/green] {written} company note(s) to {config.paths.obsidian_vault_dir}"
     )
 
 

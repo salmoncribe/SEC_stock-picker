@@ -106,12 +106,28 @@ class AutopilotConfig(BaseModel):
     obsidian_vault_subdir: str = "obsidian"
 
 
+class LLMConfig(BaseModel):
+    """Local LLM backend for relationship extraction (the connection engine).
+
+    Defaults target an ``ollama`` server on the loopback interface serving
+    ``qwen2.5:7b-instruct``. ``num_ctx`` is large enough for a full 10-K Item 1
+    section; a small model on a 16 GB machine is the reason the 7B (not 14B) is
+    the default. Everything is a plain default so no YAML entry is required.
+    """
+
+    base_url: str = "http://localhost:11434"
+    model: str = "qwen2.5:7b-instruct"
+    timeout_seconds: float = Field(default=180.0, gt=0.0)
+    num_ctx: int = Field(default=16384, ge=2048)
+
+
 class SettingsFile(BaseModel):
     app: AppInfo = AppInfo()
     http: HttpConfig = HttpConfig()
     retry: RetryConfig = RetryConfig()
     pacing: PacingConfig = PacingConfig()
     autopilot: AutopilotConfig = AutopilotConfig()
+    llm: LLMConfig = LLMConfig()
     sec: SecConfig
     fred: FredConfig
 

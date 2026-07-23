@@ -26,6 +26,7 @@ TABLES: tuple[str, ...] = (
     "event_samples",
     "impact_stats",
     "signal_status",
+    "company_edges",
     "pipeline_runs",
 )
 
@@ -391,6 +392,43 @@ SCHEMA_STATEMENTS: dict[str, str] = {
             last_evaluated_time TIMESTAMPTZ,
             schema_version      TEXT,
             UNIQUE (event_type, event_subtype, edge_type, horizon_days)
+        )
+    """,
+    "company_edges": """
+        CREATE TABLE IF NOT EXISTS company_edges (
+            edge_id               TEXT PRIMARY KEY,
+            edge_key              TEXT NOT NULL,
+            source_cik            TEXT NOT NULL,
+            source_ticker         TEXT,
+            source_company_id     TEXT,
+            target                TEXT NOT NULL,
+            target_name           TEXT NOT NULL,
+            target_cik            TEXT,
+            target_ticker         TEXT,
+            edge_type             TEXT NOT NULL,
+            resolution_status     TEXT,
+            resolution_confidence DOUBLE,
+            evidence              TEXT,
+            extraction_confidence DOUBLE,
+            extraction_method     TEXT,
+            extraction_model      TEXT,
+            accession_number      TEXT,
+            filing_id             TEXT,
+            report_date           DATE,
+            times_asserted        INTEGER,
+            first_seen_time       TIMESTAMPTZ,
+            last_seen_time        TIMESTAMPTZ,
+            source                TEXT,
+            source_url            TEXT,
+            source_record_id      TEXT,
+            event_time            TIMESTAMPTZ,
+            published_time        TIMESTAMPTZ,
+            content_hash          TEXT,
+            schema_version        TEXT,
+            validation_status     TEXT,
+            validation_errors     TEXT,
+            collected_time        TIMESTAMPTZ,
+            UNIQUE (edge_key)
         )
     """,
     "pipeline_runs": """

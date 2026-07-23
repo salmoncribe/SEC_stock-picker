@@ -341,6 +341,37 @@ SIGNAL_STATUS_COLUMNS: tuple[str, ...] = (
 )  # fmt: skip
 
 
+COMPANY_EDGE_COLUMNS: tuple[str, ...] = (
+    "edge_id", "edge_key", "source_cik", "source_ticker", "source_company_id",
+    "target", "target_name", "target_cik", "target_ticker", "edge_type",
+    "resolution_status", "resolution_confidence", "evidence",
+    "extraction_confidence", "extraction_method", "extraction_model",
+    "accession_number", "filing_id", "report_date", "times_asserted",
+    "first_seen_time", "last_seen_time", "source", "source_url",
+    "source_record_id", "event_time", "published_time", "content_hash",
+    "schema_version", "validation_status", "validation_errors", "collected_time",
+)  # fmt: skip
+
+
+def upsert_company_edges(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
+    """Upsert relationship edges, keyed on ``edge_key`` = (source, target, type).
+
+    One row per relationship, however many filings assert it -- the dedup the
+    "don't get bloated with the same info added four times" requirement asks
+    for. ``first_seen_time`` is immutable on update so the row keeps the moment
+    the claim was first observed; the collector carries ``times_asserted``
+    forward so the count reflects total assertions, not just the latest run.
+    """
+    return upsert(
+        con,
+        "company_edges",
+        rows,
+        key_cols=["edge_key"],
+        columns=COMPANY_EDGE_COLUMNS,
+        immutable_on_update=["first_seen_time"],
+    )
+
+
 def upsert_signal_status(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
     """Upsert a cell's ladder position, keyed on the cell (not the split).
 

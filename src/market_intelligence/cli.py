@@ -15,6 +15,7 @@ Commands::
     market-intelligence market compute-returns [--benchmark SPY] [--method market_model]
     market-intelligence signals build-dataset [--subtypes P,S] [--horizons 1,5,20]
     market-intelligence signals evaluate [--no-placebo]
+    market-intelligence signals extract-relationships [--ticker NKE] [--limit N]
     market-intelligence autopilot run
     market-intelligence validate
     market-intelligence reconcile [--no-verify-hashes]
@@ -44,6 +45,7 @@ from market_intelligence.collectors import filing_events as filing_events_collec
 from market_intelligence.collectors import fred as fred_collector
 from market_intelligence.collectors import insider as insider_collector
 from market_intelligence.collectors import prices as price_collector
+from market_intelligence.collectors import relationships as relationships_collector
 from market_intelligence.collectors import returns as returns_collector
 from market_intelligence.collectors import sec as sec_collector
 from market_intelligence.config import Config, ConfigError, get_config
@@ -702,6 +704,29 @@ def signals_evaluate(
         min_clusters=min_clusters, min_abs_t=min_abs_t, min_abs_mean_car=min_car
     )
     _run(lambda: impact_gate.evaluate(config, thresholds=thresholds, with_placebo=placebo))
+
+
+@signals_app.command("extract-relationships")
+def signals_extract_relationships(
+    ticker: str | None = typer.Option(None, "--ticker", help="Restrict to a single ticker."),
+    limit: int | None = typer.Option(None, "--limit", help="Max sections to process."),
+    priced_only: bool = typer.Option(
+        True, "--priced-only/--all", help="Only extract from companies with a return series."
+    ),
+) -> None:
+    """Read 10-K sections and extract typed company relationship edges via the LLM.
+
+    Needs a running ollama server (see the connection-engine setup). Resumable:
+    filings already in ``company_edges`` are skipped and results flush per batch,
+    so a full-universe run can be re-run until the candidate count is zero.
+    """
+    config = _load()
+    tickers = [ticker] if ticker else None
+    _run(
+        lambda: relationships_collector.sync(
+            config, tickers=tickers, limit=limit, priced_only=priced_only
+        )
+    )
 
 
 def main() -> None:

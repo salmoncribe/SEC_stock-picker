@@ -17,6 +17,7 @@ Commands::
     market-intelligence signals evaluate [--no-placebo]
     market-intelligence signals extract-relationships [--ticker NKE] [--limit N]
     market-intelligence autopilot run
+    market-intelligence ram-guard [--dry-run]
     market-intelligence validate
     market-intelligence reconcile [--no-verify-hashes]
     market-intelligence status
@@ -37,6 +38,7 @@ from market_intelligence import __version__, database, reconciliation
 from market_intelligence.analytics.impact import AdmissionThresholds
 from market_intelligence.analytics.returns import AbnormalReturnMethod
 from market_intelligence.autopilot import orchestrator as autopilot
+from market_intelligence.autopilot import ram_guard
 from market_intelligence.autopilot.types import RunStatus
 from market_intelligence.collectors import RunSummary
 from market_intelligence.collectors import constituents as constituents_collector
@@ -474,6 +476,48 @@ def autopilot_run() -> None:
         raise typer.Exit(code=1)
 
 
+@app.command("ram-guard")
+def ram_guard_cmd(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would be stopped without killing anything."
+    ),
+) -> None:
+    """Check memory pressure and stop duplicate processes if the mini is under it.
+
+    Only acts once macOS itself reports low free memory (default: below 20%);
+    on a healthy machine this only reports what it sees. The only things it
+    ever stops are exact duplicates of a known singleton command (a second
+    `ollama serve`, a collector or backfill script launched twice) -- never the
+    process holding the DuckDB lock, never this session or its ancestors. Safe
+    to run by hand before a long LLM run, or on a schedule (see
+    config/launchd/ai.quant.ramguard.plist).
+    """
+    config = _load()
+    result = ram_guard.run_guard(database_path=config.paths.database_path, dry_run=dry_run)
+
+    color = "yellow" if (result.killed or result.kill_candidates) else "green"
+    console.print(f"[{color}]{result.summary_line}[/{color}]")
+
+    if result.zombies:
+        console.print(
+            f"[dim]{len(result.zombies)} zombie process(es) seen (parent must reap):[/dim]"
+        )
+        for z in result.zombies:
+            console.print(f"  • pid {z.pid} (ppid {z.ppid}): {z.command[:80]}")
+
+    if result.high_memory:
+        table = Table(title="other high-memory processes (report only)", show_edge=True)
+        table.add_column("pid", justify="right")
+        table.add_column("rss (MB)", justify="right")
+        table.add_column("command")
+        for proc in result.high_memory:
+            table.add_row(str(proc.pid), f"{proc.rss_mb:.0f}", proc.command[:100])
+        console.print(table)
+
+    for note in result.notes:
+        err_console.print(f"[yellow]{note}[/yellow]")
+
+
 @app.command()
 def reconcile(
     verify_hashes: bool = typer.Option(
@@ -709,9 +753,17 @@ def signals_evaluate(
 @signals_app.command("extract-relationships")
 def signals_extract_relationships(
     ticker: str | None = typer.Option(None, "--ticker", help="Restrict to a single ticker."),
+    items: str | None = typer.Option(
+        "1", "--items", help="Comma-separated 10-K item codes (default: 1 = Business)."
+    ),
     limit: int | None = typer.Option(None, "--limit", help="Max sections to process."),
     priced_only: bool = typer.Option(
         True, "--priced-only/--all", help="Only extract from companies with a return series."
+    ),
+    latest_only: bool = typer.Option(
+        True,
+        "--latest-only/--all-filings",
+        help="Only each company's most recent filing (current relationships).",
     ),
 ) -> None:
     """Read 10-K sections and extract typed company relationship edges via the LLM.
@@ -719,12 +771,19 @@ def signals_extract_relationships(
     Needs a running ollama server (see the connection-engine setup). Resumable:
     filings already in ``company_edges`` are skipped and results flush per batch,
     so a full-universe run can be re-run until the candidate count is zero.
+    Defaults to Item 1 of each company's most recent filing -- the current
+    graph, not every historical restatement of it.
     """
     config = _load()
     tickers = [ticker] if ticker else None
     _run(
         lambda: relationships_collector.sync(
-            config, tickers=tickers, limit=limit, priced_only=priced_only
+            config,
+            tickers=tickers,
+            items=_split_csv_tuple(items) or relationships_collector.SECTION_ITEMS,
+            limit=limit,
+            priced_only=priced_only,
+            latest_only=latest_only,
         )
     )
 

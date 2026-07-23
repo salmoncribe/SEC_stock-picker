@@ -105,13 +105,17 @@ def select_sections(
     tickers: list[str] | None = None,
     items: tuple[str, ...] = SECTION_ITEMS,
     priced_only: bool = True,
+    latest_only: bool = False,
     limit: int | None = None,
     skip_extracted: bool = True,
 ) -> list[dict[str, Any]]:
     """Candidate sections to extract from, most recent filing first.
 
     ``priced_only`` restricts the *source* to companies with a return series, so
-    the edges' source end is measurable. ``skip_extracted`` subtracts filings
+    the edges' source end is measurable. ``latest_only`` keeps just each
+    company's single most recent filing -- current relationships, not twenty
+    years of re-extracting the same graph, which is the difference between an
+    overnight run and a week-long one. ``skip_extracted`` subtracts filings
     already present in ``company_edges`` -- the resumability guard.
     """
     params: list[Any] = list(items)
@@ -127,6 +131,18 @@ def select_sections(
     """
     if priced_only:
         sql += " AND c.ticker IN (SELECT DISTINCT symbol FROM daily_returns)"
+    if latest_only:
+        # Restrict to the single most recent filing per company: the accession
+        # with the latest report_date among that company's candidate sections.
+        sql += f"""
+          AND s.accession_number = (
+              SELECT s2.accession_number FROM filing_sections s2
+              WHERE s2.cik = s.cik AND s2.item_code IN ({placeholders})
+              ORDER BY s2.report_date DESC NULLS LAST, s2.accession_number
+              LIMIT 1
+          )
+        """
+        params.extend(items)
     if tickers:
         uppered = [t.upper() for t in tickers]
         sql += f" AND upper(c.ticker) IN ({', '.join(['?'] * len(uppered))})"
@@ -318,8 +334,10 @@ def sync(
     config: Config,
     *,
     tickers: list[str] | None = None,
+    items: tuple[str, ...] = SECTION_ITEMS,
     limit: int | None = None,
     priced_only: bool = True,
+    latest_only: bool = False,
     provider: LLMProvider | None = None,
     flush_every: int = DEFAULT_FLUSH_EVERY,
 ) -> RunSummary:
@@ -331,7 +349,14 @@ def sync(
         index = CompanyIndex.from_connection(con)
         prior_counts = _prior_counts(con)
 
-        candidates = select_sections(con, tickers=tickers, priced_only=priced_only, limit=limit)
+        candidates = select_sections(
+            con,
+            tickers=tickers,
+            items=items,
+            priced_only=priced_only,
+            latest_only=latest_only,
+            limit=limit,
+        )
         summary.bump("candidate_sections", len(candidates))
 
         pending: list[dict[str, Any]] = []

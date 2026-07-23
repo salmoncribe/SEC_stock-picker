@@ -75,6 +75,7 @@ def advance(
     *,
     promotion_streak: int,
     retire_after: int,
+    new_evidence: bool = True,
 ) -> SignalStatus | None:
     """Compute a cell's new ladder position from its verdict on this run.
 
@@ -90,7 +91,17 @@ def advance(
     stable, so it only matters for a cell already being tracked, where it counts
     as a failure toward retirement. ``INSUFFICIENT`` means "could not look" --
     distinct from failure, so it holds the current status and moves no streak.
+
+    ``new_evidence`` is the guard against the ladder counting *runs* instead of
+    *evidence*. A confirmation only advances the streak when the holdout grew
+    since the last evaluation; re-running the gate on unchanged data (a manual
+    re-run, or a day when nothing new matured) is not a second independent
+    confirmation and must not move a cell toward firing. When there is no new
+    evidence, an already-tracked cell is held exactly as it was.
     """
+    if not new_evidence and previous is not None:
+        return previous
+
     if verdict is Verdict.ADMITTED:
         return _confirm(previous, promotion_streak)
     if verdict is Verdict.DEMOTED:

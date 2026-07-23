@@ -379,6 +379,7 @@ SCHEMA_STATEMENTS: dict[str, str] = {
             status              TEXT NOT NULL,
             confirm_streak      INTEGER NOT NULL,
             fail_streak         INTEGER NOT NULL,
+            holdout_clusters    INTEGER,
             last_verdict        TEXT,
             last_reason         TEXT,
             mean_car            DOUBLE,
@@ -445,6 +446,13 @@ COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         # Free-form per-stage counters as JSON, so a run stays reconcilable
         # after the process that produced it is gone.
         "stage_counts": "TEXT",
+    },
+    "signal_status": {
+        # Holdout cluster count at the last evaluation. The promotion ladder
+        # advances a confirmation streak only when this grows -- i.e. when new
+        # out-of-sample evidence actually arrived -- so re-running the gate on
+        # unchanged data cannot manufacture a streak.
+        "holdout_clusters": "INTEGER",
     },
 }
 

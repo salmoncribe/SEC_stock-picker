@@ -155,6 +155,42 @@ def test_retired_cell_re_earns_candidacy_from_scratch():
     assert once.confirm_streak == 1  # streak restarts, no credit for the past
 
 
+def test_no_new_evidence_holds_a_cell_unchanged():
+    """Re-running on the same holdout must not advance a confirmation streak.
+
+    The ladder counts fresh out-of-sample evidence, not runs. Without this a
+    manual re-run -- or a day when nothing new matured -- would fabricate a
+    streak and promote on stale data, the exact self-deception the ladder
+    exists to prevent.
+    """
+    candidate = SignalStatus(LadderStatus.CANDIDATE, confirm_streak=1, fail_streak=0)
+
+    held = advance(
+        candidate, ADMIT, "", promotion_streak=K, retire_after=RETIRE, new_evidence=False
+    )
+
+    assert held == candidate  # streak did not advance, so no promotion
+
+
+def test_new_evidence_lets_a_confirmation_promote():
+    candidate = SignalStatus(LadderStatus.CANDIDATE, confirm_streak=1, fail_streak=0)
+
+    promoted = advance(
+        candidate, ADMIT, "", promotion_streak=K, retire_after=RETIRE, new_evidence=True
+    )
+
+    assert promoted is not None
+    assert promoted.status is LadderStatus.ACTIVE
+
+
+def test_first_sighting_counts_even_as_new_evidence_default():
+    """A never-seen cell (previous is None) is always fresh evidence."""
+    first = advance(None, ADMIT, "", promotion_streak=K, retire_after=RETIRE, new_evidence=False)
+
+    assert first is not None
+    assert first.confirm_streak == 1
+
+
 def test_streaks_are_mutually_exclusive():
     """A confirmation zeroes the fail streak and vice versa."""
     s = step(None, ADMIT)

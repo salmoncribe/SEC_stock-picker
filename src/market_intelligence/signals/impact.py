@@ -232,12 +232,14 @@ def _load_prev_statuses(
     rows = con.execute(
         """
         SELECT event_type, event_subtype, edge_type, horizon_days,
-               status, confirm_streak, fail_streak, became_active_time, first_seen_time
+               status, confirm_streak, fail_streak, became_active_time, first_seen_time,
+               holdout_clusters
         FROM signal_status
         """
     ).fetchall()
     columns = (
         "status", "confirm_streak", "fail_streak", "became_active_time", "first_seen_time",
+        "holdout_clusters",
     )  # fmt: skip
     return {
         (str(r[0]), r[1], str(r[2]), int(r[3])): dict(zip(columns, r[4:], strict=True))
@@ -251,6 +253,7 @@ def _status_row(
     new_status: SignalStatus,
     prev: dict[str, Any] | None,
     estimate: ImpactCell | None,
+    holdout: ImpactCell | None,
     verdict: Verdict,
     reason: str,
     now: Any,
@@ -283,6 +286,13 @@ def _status_row(
         "status": new_status.status.value,
         "confirm_streak": new_status.confirm_streak,
         "fail_streak": new_status.fail_streak,
+        # Holdout cluster count is carried forward when this run added no new
+        # evidence, so the growth check compares against the last real change.
+        "holdout_clusters": (
+            holdout.n_clusters
+            if holdout is not None
+            else (prev.get("holdout_clusters") if prev else None)
+        ),
         "last_verdict": verdict.value,
         "last_reason": reason,
         "mean_car": estimate.mean_car if estimate else None,
@@ -351,12 +361,21 @@ def evaluate(
                 if prev
                 else None
             )
+            # A confirmation only counts when the holdout actually grew since
+            # the last run; otherwise this is the same evidence re-measured, not
+            # a fresh out-of-sample check, and must not advance a streak.
+            holdout_cell = splits[HOLDOUT]
+            current_holdout = holdout_cell.n_clusters if holdout_cell else 0
+            prev_holdout = int(prev["holdout_clusters"]) if prev and prev["holdout_clusters"] else 0
+            new_evidence = current_holdout > prev_holdout
+
             new_status = advance(
                 prev_status,
                 verdict,
                 reason,
                 promotion_streak=ladder.promotion_streak,
                 retire_after=ladder.retire_after,
+                new_evidence=new_evidence,
             )
             if new_status is not None:
                 status_rows.append(
@@ -365,6 +384,7 @@ def evaluate(
                         new_status=new_status,
                         prev=prev,
                         estimate=splits[DISCOVERY] or splits[HOLDOUT],
+                        holdout=holdout_cell,
                         verdict=verdict,
                         reason=reason,
                         now=now,

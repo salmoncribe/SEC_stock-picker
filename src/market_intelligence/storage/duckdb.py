@@ -335,9 +335,9 @@ def upsert_impact_stats(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> 
 
 SIGNAL_STATUS_COLUMNS: tuple[str, ...] = (
     "signal_id", "event_type", "event_subtype", "edge_type", "horizon_days",
-    "status", "confirm_streak", "fail_streak", "last_verdict", "last_reason",
-    "mean_car", "hit_rate", "n_clusters", "direction", "first_seen_time",
-    "became_active_time", "last_evaluated_time", "schema_version",
+    "status", "confirm_streak", "fail_streak", "holdout_clusters", "last_verdict",
+    "last_reason", "mean_car", "hit_rate", "n_clusters", "direction",
+    "first_seen_time", "became_active_time", "last_evaluated_time", "schema_version",
 )  # fmt: skip
 
 

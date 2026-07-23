@@ -28,6 +28,7 @@ TABLES: tuple[str, ...] = (
     "signal_status",
     "company_edges",
     "processed_relationship_sections",
+    "trade_alerts",
     "pipeline_runs",
 )
 
@@ -441,6 +442,56 @@ SCHEMA_STATEMENTS: dict[str, str] = {
             edge_count         INTEGER,
             schema_version     TEXT,
             PRIMARY KEY (accession_number, item_code)
+        )
+    """,
+    # The trade-alert ledger: every fired alert persisted as a discrete graded
+    # prediction, the same way `signal_status` gives the signal layer its own
+    # track record.
+    #
+    # `UNIQUE (kind, ticker, trigger_key)` is the natural key that makes
+    # re-firing a no-op -- the daily briefing's lookback window re-surfaces the
+    # same event on consecutive runs, and the gap scanner can be re-run within
+    # a morning, so the insert helper must skip rows whose key already exists
+    # rather than upsert over them (see `insert_new_trade_alerts` in
+    # `storage/duckdb.py`).
+    #
+    # This table supersedes the `alerts` table designed but never built in the
+    # signal-graph spec: same purpose (persist fired predictions and backfill
+    # outcomes), now carrying the trade plan as well. That table will not be
+    # built separately.
+    "trade_alerts": """
+        CREATE TABLE IF NOT EXISTS trade_alerts (
+            alert_id          TEXT PRIMARY KEY,
+            kind              TEXT NOT NULL,
+            ticker            TEXT NOT NULL,
+            trigger_key       TEXT NOT NULL,
+            fired_at          TIMESTAMPTZ,
+            direction         INTEGER,
+            entry_ref         DOUBLE,
+            stop              DOUBLE,
+            target            DOUBLE,
+            shares            INTEGER,
+            notional          DOUBLE,
+            risk_amount       DOUBLE,
+            time_exit_date    DATE,
+            confidence        INTEGER,
+            evidence          TEXT,
+            event_id          TEXT,
+            edge_id           TEXT,
+            delivered         BOOLEAN,
+            delivery_note     TEXT,
+            outcome           TEXT,
+            outcome_return    DOUBLE,
+            graded_at         TIMESTAMPTZ,
+            unsizeable        BOOLEAN,
+            source            TEXT,
+            source_url        TEXT,
+            content_hash      TEXT,
+            schema_version    TEXT,
+            validation_status TEXT,
+            validation_errors TEXT,
+            collected_time    TIMESTAMPTZ,
+            UNIQUE (kind, ticker, trigger_key)
         )
     """,
     "pipeline_runs": """

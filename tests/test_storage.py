@@ -191,3 +191,53 @@ def test_parquet_partitioned_write(tmp_path: Path) -> None:
 
 def test_parquet_empty_records_is_noop(tmp_path: Path) -> None:
     assert parquet.write_records(tmp_path, "companies", [], ["cik"]) == []
+
+
+# --------------------------------------------------------------------------- #
+# trade_alerts ledger                                                         #
+# --------------------------------------------------------------------------- #
+class TestTradeAlerts:
+    @staticmethod
+    def _row(**overrides):
+        row = {
+            "alert_id": "a1", "kind": "reaction_lag", "ticker": "NKE",
+            "trigger_key": "ev1:self:20", "fired_at": None, "direction": 1,
+            "entry_ref": 74.2, "stop": 71.1, "target": 76.4, "shares": 13,
+            "notional": 964.6, "risk_amount": 100.0, "time_exit_date": None,
+            "confidence": 72, "evidence": "{}", "event_id": "ev1",
+            "edge_id": "self", "delivered": False, "delivery_note": None,
+            "outcome": "open", "outcome_return": None, "graded_at": None,
+            "unsizeable": False, "schema_version": "1.0.0",
+        }
+        row.update(overrides)
+        return row
+
+    def test_insert_new_inserts_and_skips_existing(self, memory_db):
+        from market_intelligence.storage import duckdb as duckdb_store
+        first = duckdb_store.insert_new_trade_alerts(memory_db, [self._row()])
+        assert len(first) == 1
+        again = duckdb_store.insert_new_trade_alerts(
+            memory_db, [self._row(alert_id="a2", confidence=99)]
+        )
+        assert again == []  # same (kind, ticker, trigger_key): re-fire is a no-op
+        n = memory_db.execute("SELECT count(*) FROM trade_alerts").fetchone()[0]
+        assert n == 1
+        kept = memory_db.execute("SELECT confidence FROM trade_alerts").fetchone()[0]
+        assert kept == 72  # first firing wins; nothing overwritten
+
+    def test_insert_new_distinct_trigger_key_coexists(self, memory_db):
+        from market_intelligence.storage import duckdb as duckdb_store
+        duckdb_store.insert_new_trade_alerts(memory_db, [self._row()])
+        second = duckdb_store.insert_new_trade_alerts(
+            memory_db, [self._row(alert_id="a2", trigger_key="ev2:self:20")]
+        )
+        assert len(second) == 1  # different trigger_key: a new row, not a skip
+        n = memory_db.execute("SELECT count(*) FROM trade_alerts").fetchone()[0]
+        assert n == 2
+
+    def test_insert_new_empty_input_returns_empty_list(self, memory_db):
+        from market_intelligence.storage import duckdb as duckdb_store
+        result = duckdb_store.insert_new_trade_alerts(memory_db, [])
+        assert result == []
+        n = memory_db.execute("SELECT count(*) FROM trade_alerts").fetchone()[0]
+        assert n == 0

@@ -139,6 +139,44 @@ def upsert(
     return UpsertResult(table, len(to_insert), len(to_update), deduped)
 
 
+TRADE_ALERT_KEY = ("kind", "ticker", "trigger_key")
+
+
+def insert_new_trade_alerts(
+    con: duckdb.DuckDBPyConnection, rows: Iterable[Row]
+) -> list[Row]:
+    """Insert rows whose (kind, ticker, trigger_key) is unseen; return them.
+
+    Insert-only, first-firing-wins semantics -- deliberately not the generic
+    ``upsert``. An alert is a discrete prediction: once fired, its plan must
+    never change underneath it. The generic ``upsert`` would overwrite the
+    original plan on re-fire (e.g. the daily briefing's lookback window
+    re-surfacing the same event), which is exactly what the ledger must never
+    do. Rows whose key already exists in the table are silently dropped.
+
+    "First firing wins" describes behaviour *across calls*: once a key is
+    committed, no later call can change it. Within a single call, the house
+    ``_dedupe_last_wins`` helper collapses same-key duplicates by keeping the
+    *last* occurrence in the batch -- that collapse happens before the
+    against-the-table existence check, so it only decides which of several
+    simultaneous duplicates in one batch is offered for insertion, not
+    whether an already-persisted alert can be overwritten.
+    """
+    materialized = [dict(r) for r in rows]
+    if not materialized:
+        return []
+    materialized = _dedupe_last_wins(materialized, TRADE_ALERT_KEY)
+    existing = _existing_keys(con, "trade_alerts", TRADE_ALERT_KEY)
+    fresh = [
+        r for r in materialized
+        if tuple(r.get(c) for c in TRADE_ALERT_KEY) not in existing
+    ]
+    if fresh:
+        columns = [r[1] for r in con.execute('PRAGMA table_info("trade_alerts")').fetchall()]
+        _insert(con, "trade_alerts", fresh, columns)
+    return fresh
+
+
 # --------------------------------------------------------------------------- #
 # Table-specific wrappers                                                      #
 # --------------------------------------------------------------------------- #

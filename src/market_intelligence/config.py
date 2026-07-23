@@ -121,6 +121,41 @@ class LLMConfig(BaseModel):
     num_ctx: int = Field(default=16384, ge=2048)
 
 
+class TradingConfig(BaseModel):
+    """User-owned risk parameters for rendered trade plans.
+
+    Every number here belongs to Michael, not the system: the alert layer only
+    does arithmetic with them. ``account_equity`` ships as an obvious
+    placeholder so a rendered size is never mistaken for advice about a real
+    account until he sets it.
+    """
+
+    account_equity: float = Field(default=10_000.0, gt=0.0)
+    risk_pct_per_trade: float = Field(default=1.0, gt=0.0, le=100.0)
+    atr_period: int = Field(default=14, ge=2)
+    atr_stop_multiple: float = Field(default=2.0, gt=0.0)
+    max_position_pct: float = Field(default=20.0, gt=0.0, le=100.0)
+    min_confidence: int = Field(default=60, ge=0, le=100)
+
+
+class GapScannerConfig(BaseModel):
+    """Morning price-gap scan thresholds (see trade-alerts design §8).
+
+    ``gap_target_r_multiple`` sets the profit target as a multiple of the stop
+    distance: target = entry +/- (gap_target_r_multiple * R), where R is the
+    entry-to-stop distance. ``require_catalyst`` defaults to False so the
+    scanner also surfaces unexplained gaps (no confirmed news event) rather
+    than only catalyst-backed ones — Michael reviews those manually.
+    """
+
+    min_gap_pct: float = Field(default=3.0, gt=0.0)
+    min_avg_dollar_volume: float = Field(default=5_000_000.0, gt=0.0)
+    gap_target_r_multiple: float = Field(default=2.0, gt=0.0)
+    gap_max_hold_days: int = Field(default=5, ge=1)
+    gap_catalyst_lookback_days: int = Field(default=7, ge=1)
+    require_catalyst: bool = False
+
+
 class SettingsFile(BaseModel):
     app: AppInfo = AppInfo()
     http: HttpConfig = HttpConfig()
@@ -128,6 +163,8 @@ class SettingsFile(BaseModel):
     pacing: PacingConfig = PacingConfig()
     autopilot: AutopilotConfig = AutopilotConfig()
     llm: LLMConfig = LLMConfig()
+    trading: TradingConfig = TradingConfig()
+    gap_scanner: GapScannerConfig = GapScannerConfig()
     sec: SecConfig
     fred: FredConfig
 

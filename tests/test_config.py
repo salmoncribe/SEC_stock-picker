@@ -8,8 +8,11 @@ import pytest
 
 from market_intelligence.config import (
     CompanyEntry,
+    Config,
     ConfigError,
     FredDefaults,
+    GapScannerConfig,
+    TradingConfig,
     load_config,
 )
 
@@ -91,3 +94,45 @@ def test_fingerprint_is_stable_and_serializable() -> None:
     second = load_config(project_root=PROJECT_ROOT).fingerprint()
     assert first == second
     assert "series" in first and "forms" in first
+
+
+class TestTradingConfig:
+    def test_model_defaults_without_yaml_entry(self) -> None:
+        """Constructed directly (no settings.yaml involved) — pins the actual defaults."""
+        t = TradingConfig()
+        assert t.account_equity == 10_000.0
+        assert t.risk_pct_per_trade == 1.0
+        assert t.atr_period == 14
+        assert t.atr_stop_multiple == 2.0
+        assert t.max_position_pct == 20.0
+        assert t.min_confidence == 60
+
+    def test_yaml_values_load(self, tmp_config: Config) -> None:
+        t = tmp_config.settings.trading
+        assert t.account_equity > 0
+        assert 0 < t.risk_pct_per_trade <= 100
+        assert t.atr_period >= 2
+        assert t.atr_stop_multiple > 0
+        assert 0 < t.max_position_pct <= 100
+        assert 0 <= t.min_confidence <= 100
+
+
+class TestGapScannerConfig:
+    def test_model_defaults_without_yaml_entry(self) -> None:
+        """Constructed directly (no settings.yaml involved) — pins the actual defaults."""
+        g = GapScannerConfig()
+        assert g.min_gap_pct == 3.0
+        assert g.min_avg_dollar_volume == 5_000_000.0
+        assert g.gap_target_r_multiple == 2.0
+        assert g.gap_max_hold_days == 5
+        assert g.gap_catalyst_lookback_days == 7
+        assert g.require_catalyst is False
+
+    def test_yaml_values_load(self, tmp_config: Config) -> None:
+        g = tmp_config.settings.gap_scanner
+        assert g.min_gap_pct > 0
+        assert g.min_avg_dollar_volume > 0
+        assert g.gap_target_r_multiple > 0
+        assert g.gap_max_hold_days >= 1
+        assert g.gap_catalyst_lookback_days >= 1
+        assert g.require_catalyst in (True, False)

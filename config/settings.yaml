@@ -48,3 +48,22 @@ fred:
   series_observations_path: "/fred/series/observations"
   series_path: "/fred/series"
   file_type: "json"
+
+# Trade-alert layer (docs/specs/2026-07-23-trade-alerts-design.md).
+# These are Michael's numbers, not the system's. account_equity is a
+# PLACEHOLDER — set your real figure before trusting rendered sizes.
+trading:
+  account_equity: 10000
+  risk_pct_per_trade: 1.0
+  atr_period: 14
+  atr_stop_multiple: 2.0
+  max_position_pct: 20.0
+  min_confidence: 60
+
+gap_scanner:
+  min_gap_pct: 3.0
+  min_avg_dollar_volume: 5000000
+  gap_target_r_multiple: 2.0
+  gap_max_hold_days: 5
+  gap_catalyst_lookback_days: 7
+  require_catalyst: false

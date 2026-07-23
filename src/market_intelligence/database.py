@@ -27,6 +27,7 @@ TABLES: tuple[str, ...] = (
     "impact_stats",
     "signal_status",
     "company_edges",
+    "processed_relationship_sections",
     "pipeline_runs",
 )
 
@@ -429,6 +430,17 @@ SCHEMA_STATEMENTS: dict[str, str] = {
             validation_errors     TEXT,
             collected_time        TIMESTAMPTZ,
             UNIQUE (edge_key)
+        )
+    """,
+    "processed_relationship_sections": """
+        CREATE TABLE IF NOT EXISTS processed_relationship_sections (
+            accession_number   TEXT NOT NULL,
+            item_code          TEXT NOT NULL,
+            source_ticker      TEXT,
+            processed_time     TIMESTAMPTZ,
+            edge_count         INTEGER,
+            schema_version     TEXT,
+            PRIMARY KEY (accession_number, item_code)
         )
     """,
     "pipeline_runs": """

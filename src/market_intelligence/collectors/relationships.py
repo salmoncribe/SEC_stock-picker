@@ -153,6 +153,11 @@ def select_sections(
               SELECT 1 FROM company_edges e
               WHERE e.accession_number = s.accession_number
           )
+          AND NOT EXISTS (
+              SELECT 1 FROM processed_relationship_sections p
+              WHERE p.accession_number = s.accession_number
+                AND p.item_code = s.item_code
+          )
         """
     sql += " ORDER BY s.report_date DESC NULLS LAST, s.cik, s.item_code"
     if limit is not None:
@@ -330,6 +335,34 @@ def _prior_counts(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
     return {str(r[0]): int(r[1] or 0) for r in rows}
 
 
+def _mark_processed(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    candidate: dict[str, Any],
+    edge_count: int,
+    schema_version: str,
+) -> None:
+    con.execute(
+        """
+        INSERT INTO processed_relationship_sections
+          (accession_number, item_code, source_ticker, processed_time, edge_count, schema_version)
+        VALUES (?, ?, ?, current_timestamp, ?, ?)
+        ON CONFLICT (accession_number, item_code) DO UPDATE SET
+          source_ticker = excluded.source_ticker,
+          processed_time = excluded.processed_time,
+          edge_count = excluded.edge_count,
+          schema_version = excluded.schema_version
+        """,
+        [
+            candidate.get("accession_number"),
+            candidate.get("item_code"),
+            candidate.get("ticker"),
+            edge_count,
+            schema_version,
+        ],
+    )
+
+
 def sync(
     config: Config,
     *,
@@ -364,6 +397,12 @@ def sync(
             text = _read_text(candidate["text_path"])
             if not text:
                 summary.bump("empty_sections")
+                _mark_processed(
+                    con,
+                    candidate=candidate,
+                    edge_count=0,
+                    schema_version=schema_version,
+                )
                 continue
 
             try:
@@ -379,6 +418,7 @@ def sync(
                 continue
 
             summary.bump("sections_processed")
+            stored_for_section = 0
             for raw in raw_edges:
                 edge = _build_edge(
                     candidate,
@@ -397,7 +437,15 @@ def sync(
                     summary.bump("unresolved_edges")
                 prior_counts[edge.edge_key] = edge.times_asserted
                 summary.collected += 1
+                stored_for_section += 1
                 pending.append(edge.to_row())
+
+            _mark_processed(
+                con,
+                candidate=candidate,
+                edge_count=stored_for_section,
+                schema_version=schema_version,
+            )
 
             if len(pending) >= flush_every:
                 _flush(config, con, summary, pending)

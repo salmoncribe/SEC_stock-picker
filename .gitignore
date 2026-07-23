@@ -39,3 +39,4 @@ logs/**/*.log
 .idea/
 .vscode/
 *.swp
+docs/specs/.obsidian/

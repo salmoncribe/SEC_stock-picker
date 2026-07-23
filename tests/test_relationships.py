@@ -187,6 +187,54 @@ def test_unknown_edge_type_is_skipped(tmp_config: Config) -> None:
     assert summary.collected == 0
 
 
+def test_zero_edge_section_is_marked_processed(tmp_config: Config) -> None:
+    """A quiet filing must not pin small watchdog batches forever."""
+    _seed(tmp_config, "No named customers, suppliers, competitors, or partners.")
+
+    first = _run(tmp_config, [])
+    provider = StubProvider([])
+    second = relationships.sync(tmp_config, provider=provider)
+
+    assert first.collected == 0
+    assert first.stage["sections_processed"] == 1
+    assert second.stage["candidate_sections"] == 0
+    assert provider.calls == 0
+    with database.connection(tmp_config.paths.database_path) as con:
+        row = con.execute(
+            """
+            SELECT accession_number, item_code, edge_count
+            FROM processed_relationship_sections
+            """
+        ).fetchone()
+    assert row == ("0001045810-26-000001", "1", 0)
+
+
+def test_empty_section_is_marked_processed(tmp_config: Config) -> None:
+    """An empty text file must not pin small watchdog batches forever."""
+    _seed(tmp_config, "")
+
+    first_provider = StubProvider(
+        [{"target": "Microsoft Corporation", "type": "customer", "evidence": "x", "confidence": 0.9}]
+    )
+    first = relationships.sync(tmp_config, provider=first_provider)
+    second_provider = StubProvider([])
+    second = relationships.sync(tmp_config, provider=second_provider)
+
+    assert first.collected == 0
+    assert first.stage["empty_sections"] == 1
+    assert first_provider.calls == 0
+    assert second.stage["candidate_sections"] == 0
+    assert second_provider.calls == 0
+    with database.connection(tmp_config.paths.database_path) as con:
+        row = con.execute(
+            """
+            SELECT accession_number, item_code, edge_count
+            FROM processed_relationship_sections
+            """
+        ).fetchone()
+    assert row == ("0001045810-26-000001", "1", 0)
+
+
 def test_rerun_does_not_reprocess_or_duplicate(tmp_config: Config) -> None:
     """The resumability guard: an already-extracted filing is skipped."""
     _seed(tmp_config, "NVIDIA sells to Microsoft.")

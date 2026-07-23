@@ -28,6 +28,11 @@ pacing:
   fred:
     requests_per_second: 8.0
 
+llm:
+  model: "qwen2.5:7b-instruct"
+  timeout_seconds: 240.0
+  num_ctx: 8192
+
 sec:
   base_url: "https://www.sec.gov"
   data_base_url: "https://data.sec.gov"

@@ -13,6 +13,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 MAX_PASSES=${1:-50}
 LOG="logs/extract_relationships.log"
+BATCH_LIMIT=${RELATIONSHIP_BATCH_LIMIT:-}
 mkdir -p logs
 
 OLLAMA_MODELS=/Volumes/Extreme/home-migrated/ollama-models
@@ -21,7 +22,13 @@ OLLAMA_BIN=/opt/homebrew/opt/ollama/bin/ollama
 ensure_ollama() {
   curl -s http://localhost:11434/api/version >/dev/null 2>&1 && return 0
   echo "--- starting ollama ($(date)) ---" >>"$LOG"
-  OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_FLASH_ATTENTION=1 nohup "$OLLAMA_BIN" serve \
+  OLLAMA_MODELS="$OLLAMA_MODELS" \
+    OLLAMA_FLASH_ATTENTION=1 \
+    OLLAMA_KEEP_ALIVE=30s \
+    OLLAMA_NUM_PARALLEL=1 \
+    OLLAMA_MAX_LOADED_MODELS=1 \
+    OLLAMA_CONTEXT_LENGTH=8192 \
+    nohup "$OLLAMA_BIN" serve \
     >>logs/ollama.log 2>&1 &
   for _ in $(seq 1 30); do
     curl -s http://localhost:11434/api/version >/dev/null 2>&1 && return 0
@@ -60,6 +67,11 @@ else:
               AND NOT EXISTS (
                   SELECT 1 FROM company_edges e WHERE e.accession_number = s.accession_number
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM processed_relationship_sections p
+                  WHERE p.accession_number = s.accession_number
+                    AND p.item_code = s.item_code
+              )
             """
         ).fetchone()[0]
     )
@@ -78,10 +90,14 @@ for pass in $(seq 1 "$MAX_PASSES"); do
     exit 0
   fi
 
-  uv run market-intelligence signals extract-relationships --items 1 --latest-only >>"$LOG" 2>&1
-  status=$?
-  echo "--- pass $pass exited $status ($(date)) ---" >>"$LOG"
-  [ "$status" -ne 0 ] && sleep 30
+  cmd=(uv run market-intelligence signals extract-relationships --items 1 --latest-only)
+  if [ -n "$BATCH_LIMIT" ]; then
+    cmd+=(--limit "$BATCH_LIMIT")
+  fi
+  "${cmd[@]}" >>"$LOG" 2>&1
+  exit_status=$?
+  echo "--- pass $pass exited $exit_status ($(date)) ---" >>"$LOG"
+  [ "$exit_status" -ne 0 ] && sleep 30
 done
 
 echo "=== stopped after $MAX_PASSES passes, $(remaining) remaining $(date) ===" >>"$LOG"

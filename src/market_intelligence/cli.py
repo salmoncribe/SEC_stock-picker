@@ -13,6 +13,7 @@ Commands::
     market-intelligence market sync-constituents
     market-intelligence market sync-prices [--symbols NVDA,MU] [--start YYYY-MM-DD]
     market-intelligence market compute-returns [--benchmark SPY] [--method market_model]
+    market-intelligence market scan-gaps [--dry-run]
     market-intelligence signals build-dataset [--subtypes P,S] [--horizons 1,5,20]
     market-intelligence signals evaluate [--no-placebo]
     market-intelligence signals extract-relationships [--ticker NKE] [--limit N]
@@ -45,6 +46,7 @@ from market_intelligence.collectors import constituents as constituents_collecto
 from market_intelligence.collectors import documents as document_collector
 from market_intelligence.collectors import filing_events as filing_events_collector
 from market_intelligence.collectors import fred as fred_collector
+from market_intelligence.collectors import gaps as gaps_collector
 from market_intelligence.collectors import insider as insider_collector
 from market_intelligence.collectors import prices as price_collector
 from market_intelligence.collectors import relationships as relationships_collector
@@ -687,6 +689,44 @@ def market_compute_returns(
             method=chosen,
         )
     )
+
+
+@market_app.command("scan-gaps")
+def market_scan_gaps(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Build and persist candidates, but skip the Telegram send.",
+    ),
+) -> None:
+    """Morning gap scan: overnight price gaps -> the trade-alert ledger.
+
+    Reads survivors, fetches live quotes, plans candidates, persists new
+    rows, and (unless --dry-run) sends the sendable ones to Telegram. See
+    ``collectors/gaps.py`` for the three-phase DB-lock-safe design and the
+    LaunchAgent at ``config/launchd/ai.quant.morning-scan.plist``.
+
+    Exit codes deliberately diverge from the usual success/failure mapping:
+    a busy DuckDB lock makes ``scan`` return a "skipped" summary rather than
+    raising -- that is the designed outcome (another collector or the
+    relationship extractor held the write lock), not a crash, so it exits 0
+    like a normal success. A "partial" summary (a mostly-throttled quote
+    provider) still completed the run and exits 0 too; only an actual
+    exception, or a status this scan never produces in practice, exits 1.
+    """
+    config = _load()
+    try:
+        summary = gaps_collector.scan(config, notify=not dry_run)
+    except ConfigError as exc:
+        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+    except Exception as exc:  # surfaced to the user, not swallowed
+        log.error("pipeline_failed", error=str(exc))
+        err_console.print(f"[red]Pipeline failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    _emit_summary(summary)
+    if summary.status not in ("success", "skipped", "partial"):
+        raise typer.Exit(code=1)
 
 
 @signals_app.command("build-dataset")

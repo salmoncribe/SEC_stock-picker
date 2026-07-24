@@ -9,11 +9,14 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
 
 from market_intelligence.cli import app
+from market_intelligence.collectors import RunSummary
+from market_intelligence.collectors import gaps as gaps_collector
 from market_intelligence.config import reset_config_cache
 
 runner = CliRunner()
@@ -91,3 +94,51 @@ def test_fred_sync_without_key_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
     reset_config_cache()
     result = runner.invoke(app, ["fred", "sync"])
     assert result.exit_code == 2
+
+
+def test_scan_gaps_invokes_scan_and_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_scan(config: object, **kwargs: object) -> RunSummary:
+        captured.update(kwargs)
+        return RunSummary(pipeline_name="gaps.scan", status="success")
+
+    monkeypatch.setattr(gaps_collector, "scan", fake_scan)
+    result = runner.invoke(app, ["market", "scan-gaps"])
+
+    assert result.exit_code == 0
+    assert captured["notify"] is True
+
+
+def test_scan_gaps_dry_run_passes_notify_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_scan(config: object, **kwargs: object) -> RunSummary:
+        captured.update(kwargs)
+        return RunSummary(pipeline_name="gaps.scan", status="success")
+
+    monkeypatch.setattr(gaps_collector, "scan", fake_scan)
+    result = runner.invoke(app, ["market", "scan-gaps", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert captured["notify"] is False
+
+
+def test_scan_gaps_skipped_status_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_scan(config: object, **kwargs: object) -> RunSummary:
+        return RunSummary(pipeline_name="gaps.scan", status="skipped")
+
+    monkeypatch.setattr(gaps_collector, "scan", fake_scan)
+    result = runner.invoke(app, ["market", "scan-gaps"])
+
+    assert result.exit_code == 0
+
+
+def test_scan_gaps_raising_exits_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_scan(config: object, **kwargs: object) -> RunSummary:
+        raise RuntimeError("provider blew up")
+
+    monkeypatch.setattr(gaps_collector, "scan", fake_scan)
+    result = runner.invoke(app, ["market", "scan-gaps"])
+
+    assert result.exit_code == 1

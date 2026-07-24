@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Morning gap scan: overnight price gaps -> the trade-alert ledger.
+
+  Runs `market-intelligence market scan-gaps` every weekday at 08:45 local
+  time, before the market open, so a candidate's evidence is fresh when it
+  lands on Telegram. Contains NO secrets: the app loads `.env` (git-ignored)
+  itself, which is where MARKET_INTELLIGENCE_HOME and the optional
+  TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID live. A missing Telegram token just
+  skips the send; the ledger is still written. A busy DuckDB lock (another
+  collector or the relationship extractor holding the write lock) makes the
+  scan itself skip and exit 0 -- see collectors/gaps.py -- so a missed run
+  shows up as a quiet skip in the logs, not a launchd failure.
+
+  Install:
+    cp config/launchd/ai.quant.morning-scan.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/ai.quant.morning-scan.plist
+  Run once now to test:
+    launchctl start ai.quant.morning-scan
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/ai.quant.morning-scan.plist
+
+  Installation is Michael's call -- this file is committed but not loaded.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.quant.morning-scan</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>cd /Users/michaeltadlock/quant &amp;&amp; /opt/homebrew/bin/uv run market-intelligence market scan-gaps</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Weekday</key>
+            <integer>1</integer>
+            <key>Hour</key>
+            <integer>8</integer>
+            <key>Minute</key>
+            <integer>45</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>2</integer>
+            <key>Hour</key>
+            <integer>8</integer>
+            <key>Minute</key>
+            <integer>45</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>3</integer>
+            <key>Hour</key>
+            <integer>8</integer>
+            <key>Minute</key>
+            <integer>45</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>4</integer>
+            <key>Hour</key>
+            <integer>8</integer>
+            <key>Minute</key>
+            <integer>45</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>5</integer>
+            <key>Hour</key>
+            <integer>8</integer>
+            <key>Minute</key>
+            <integer>45</integer>
+        </dict>
+    </array>
+
+    <!-- If the mini was asleep at 08:45, run as soon as it wakes. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/michaeltadlock/quant/logs/morning-scan.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/michaeltadlock/quant/logs/morning-scan.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -8,15 +8,19 @@ that had nothing to report.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
+
+import pytest
 
 from market_intelligence import database
 from market_intelligence.autopilot import briefing as briefing_builder
-from market_intelligence.autopilot import orchestrator
+from market_intelligence.autopilot import notify, orchestrator
 from market_intelligence.autopilot.orchestrator import Step
 from market_intelligence.autopilot.types import ChangeKind, RunStatus
 from market_intelligence.collectors import RunSummary
 from market_intelligence.config import Config
+from market_intelligence.signals import trade_alerts as trade_alerts_builder
 from market_intelligence.signals.promotion import LadderStatus
 from market_intelligence.storage import duckdb as duckdb_store
 
@@ -74,6 +78,43 @@ def _seed_event(
     with database.connection(config.paths.database_path) as con:
         database.init_db(con)
         duckdb_store.upsert_events(con, [row])
+
+
+def _price_row(symbol: str, price_date: date, close: float) -> dict[str, Any]:
+    return {
+        "price_id": f"{symbol}-{price_date.isoformat()}",
+        "symbol": symbol,
+        "price_date": price_date,
+        "open": close - 0.5,
+        "high": close + 1.0,
+        "low": close - 1.0,
+        "close": close,
+        "adj_close": close,
+        "volume": 5_000_000,
+        "provider": "yfinance",
+        "validation_status": "valid",
+        "source": "market",
+    }
+
+
+def _seed_prices(
+    config: Config,
+    symbol: str,
+    *,
+    as_of: date,
+    n: int = 40,
+    start_close: float = 100.0,
+) -> None:
+    """n bars for ``symbol`` ending on/before ``as_of`` (see test_trade_alerts.py)."""
+    rows = []
+    close = start_close
+    first_day = as_of - timedelta(days=n - 1)
+    for i in range(n):
+        close += 0.4 if i % 2 == 0 else -0.3
+        rows.append(_price_row(symbol, first_day + timedelta(days=i), close))
+    with database.connection(config.paths.database_path) as con:
+        database.init_db(con)
+        duckdb_store.upsert_daily_prices(con, rows)
 
 
 def _snapshot(config: Config) -> dict[briefing_builder.CellKey, str]:
@@ -247,3 +288,117 @@ def test_the_run_diffs_this_runs_transitions(tmp_config: Config) -> None:
 
     assert briefing.run_status == RunStatus.SUCCESS
     assert [c.kind for c in briefing.changes] == [ChangeKind.ACTIVATED]
+
+
+# --------------------------------------------------------------------------- #
+# trade alerts: the daily loop persists and sends them                       #
+# --------------------------------------------------------------------------- #
+def _seed_alertable_cell(
+    tmp_config: Config,
+    *,
+    ticker: str = "AMD",
+    hit_rate: float = 0.58,
+    extraction_confidence: float = 0.9,
+) -> None:
+    """A fired self-edge alert with enough price history to plan a trade."""
+    _seed_status(
+        tmp_config,
+        subtype="P",
+        horizon=20,
+        status=LadderStatus.ACTIVE.value,
+        direction=1,
+        hit_rate=hit_rate,
+    )
+    _seed_event(
+        tmp_config,
+        ticker=ticker,
+        subtype="P",
+        available=datetime(2026, 7, 22, tzinfo=UTC),
+        extraction_confidence=extraction_confidence,
+    )
+    _seed_prices(tmp_config, ticker, as_of=AS_OF)
+
+
+def _trade_alert_rows(config: Config) -> list[tuple[Any, ...]]:
+    with database.connection(config.paths.database_path) as con:
+        return con.execute(
+            "SELECT alert_id, confidence, delivered, delivery_note FROM trade_alerts"
+        ).fetchall()
+
+
+def test_a_fired_alert_persists_one_row_and_dedups_on_rerun(tmp_config: Config) -> None:
+    _seed_alertable_cell(tmp_config)
+
+    orchestrator.run(tmp_config, as_of=AS_OF, steps=[])
+
+    rows = _trade_alert_rows(tmp_config)
+    assert len(rows) == 1
+    first_alert_id, first_confidence = rows[0][0], rows[0][1]
+
+    orchestrator.run(tmp_config, as_of=AS_OF, steps=[])
+
+    rows_again = _trade_alert_rows(tmp_config)
+    assert len(rows_again) == 1
+    assert rows_again[0][0] == first_alert_id
+    assert rows_again[0][1] == first_confidence
+
+
+def test_a_broken_trade_alert_build_leaves_a_note_and_does_not_alter_run_status(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_alertable_cell(tmp_config)
+
+    def boom(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("build blew up")
+
+    monkeypatch.setattr(trade_alerts_builder, "build_records", boom)
+
+    briefing = orchestrator.run(tmp_config, as_of=AS_OF, steps=[])
+
+    # run_status reflects only what the step loop produced (empty here ->
+    # SUCCESS); the trade-alert failure is reported solely via the note.
+    assert briefing.run_status == RunStatus.SUCCESS
+    assert any("trade-alerts FAILED" in n for n in briefing.notes)
+    assert _trade_alert_rows(tmp_config) == []
+
+
+def test_a_sent_alert_is_stamped_delivered(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_alertable_cell(tmp_config)
+    captured: dict[str, Any] = {}
+
+    def fake_send(_config: Config, records: Any) -> bool:
+        captured["records"] = list(records)
+        return True
+
+    monkeypatch.setattr(notify, "send_trade_alerts", fake_send)
+
+    orchestrator.run(tmp_config, as_of=AS_OF, steps=[])
+
+    assert len(captured["records"]) == 1
+
+    rows = _trade_alert_rows(tmp_config)
+    assert len(rows) == 1
+    assert rows[0][2] is True  # delivered
+
+
+def test_a_gated_alert_is_never_sent(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_alertable_cell(tmp_config)
+    # Push the confidence floor above anything this fixture can score, so the
+    # one alert built here is gated regardless of the confidence blend.
+    tmp_config.settings.trading.min_confidence = 99
+
+    def fail_if_called(*_args: object, **_kwargs: object) -> bool:
+        raise AssertionError("send_trade_alerts must not be called for a gated record")
+
+    monkeypatch.setattr(notify, "send_trade_alerts", fail_if_called)
+
+    orchestrator.run(tmp_config, as_of=AS_OF, steps=[])
+
+    rows = _trade_alert_rows(tmp_config)
+    assert len(rows) == 1
+    assert rows[0][2] is False  # delivered
+    assert rows[0][3] == "gated_below_min_confidence"

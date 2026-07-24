@@ -67,6 +67,10 @@ class EventAlert:
     matches a cell the ladder currently trusts. ``predicted_car`` is that cell's
     measured mean move and ``direction`` its sign; ``basis`` explains which cell
     and how strong its track record is (e.g. "active, holdout hit 58.8%").
+
+    The alert also carries the identifiers and stats the trade-alert layer
+    needs: ``event_id`` is the ledger's dedup key, and ``hit_rate``,
+    ``n_clusters``, ``extraction_confidence`` feed its confidence score.
     """
 
     ticker: str
@@ -77,6 +81,10 @@ class EventAlert:
     direction: int
     predicted_car: float
     basis: str
+    event_id: str = ""
+    hit_rate: float | None = None
+    n_clusters: int = 0
+    extraction_confidence: float | None = None
 
 
 @dataclass(frozen=True)

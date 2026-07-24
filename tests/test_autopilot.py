@@ -54,7 +54,14 @@ def _seed_status(
         duckdb_store.upsert_signal_status(con, [row])
 
 
-def _seed_event(config: Config, *, ticker: str, subtype: str, available: datetime) -> None:
+def _seed_event(
+    config: Config,
+    *,
+    ticker: str,
+    subtype: str,
+    available: datetime,
+    extraction_confidence: float = 0.9,
+) -> None:
     row = {
         "event_id": f"evt-{ticker}-{subtype}-{available.date()}",
         "event_type": "insider_transaction",
@@ -62,6 +69,7 @@ def _seed_event(config: Config, *, ticker: str, subtype: str, available: datetim
         "event_subtype": subtype,
         "ticker": ticker,
         "available_time": available,
+        "extraction_confidence": extraction_confidence,
     }
     with database.connection(config.paths.database_path) as con:
         database.init_db(con)
@@ -126,8 +134,21 @@ def test_unchanged_cells_produce_no_line(tmp_config: Config) -> None:
 # alerts                                                                      #
 # --------------------------------------------------------------------------- #
 def test_recent_event_through_active_cell_fires_an_alert(tmp_config: Config) -> None:
-    _seed_status(tmp_config, subtype="P", horizon=20, status=LadderStatus.ACTIVE.value, direction=1)
-    _seed_event(tmp_config, ticker="AMD", subtype="P", available=datetime(2026, 7, 22, tzinfo=UTC))
+    _seed_status(
+        tmp_config,
+        subtype="P",
+        horizon=20,
+        status=LadderStatus.ACTIVE.value,
+        direction=1,
+        hit_rate=0.58,
+    )
+    _seed_event(
+        tmp_config,
+        ticker="AMD",
+        subtype="P",
+        available=datetime(2026, 7, 22, tzinfo=UTC),
+        extraction_confidence=0.87,
+    )
 
     with database.connection(tmp_config.paths.database_path) as con:
         alerts = briefing_builder.event_alerts(con, as_of=AS_OF, lookback_days=4)
@@ -137,6 +158,10 @@ def test_recent_event_through_active_cell_fires_an_alert(tmp_config: Config) -> 
     assert alerts[0].direction == 1
     assert alerts[0].predicted_car == 0.01
     assert alerts[0].horizon_days == 20
+    assert alerts[0].event_id == "evt-AMD-P-2026-07-22"
+    assert alerts[0].hit_rate == 0.58
+    assert alerts[0].n_clusters == 500
+    assert alerts[0].extraction_confidence == 0.87
 
 
 def test_event_through_a_non_active_cell_does_not_fire(tmp_config: Config) -> None:

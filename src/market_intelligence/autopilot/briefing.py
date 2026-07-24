@@ -145,11 +145,16 @@ def event_alerts(
 
     The lookback covers more than one day on purpose: a daily loop that misses a
     weekend or a run must not silently drop the events in the gap.
+
+    Each alert also carries what the trade-alert layer needs: ``event_id`` for
+    the ledger's dedup key, the cell's ``hit_rate``/``n_clusters`` and the
+    event's ``extraction_confidence`` for its confidence score.
     """
     rows = con.execute(
         """
         SELECT e.ticker, e.event_type, e.event_subtype, e.available_time,
-               s.horizon_days, s.direction, s.mean_car, s.hit_rate
+               s.horizon_days, s.direction, s.mean_car, s.hit_rate,
+               e.event_id, s.n_clusters, e.extraction_confidence
         FROM events e
         JOIN signal_status s
           ON s.event_type = e.event_type
@@ -166,7 +171,19 @@ def event_alerts(
     ).fetchall()
 
     alerts: list[EventAlert] = []
-    for ticker, etype, subtype, available_time, horizon, direction, mean_car, hit_rate in rows:
+    for (
+        ticker,
+        etype,
+        subtype,
+        available_time,
+        horizon,
+        direction,
+        mean_car,
+        hit_rate,
+        event_id,
+        n_clusters,
+        extraction_confidence,
+    ) in rows:
         hit_pct = f"{float(hit_rate):.1%}" if hit_rate is not None else "n/a"
         alerts.append(
             EventAlert(
@@ -178,6 +195,12 @@ def event_alerts(
                 direction=int(direction) if direction is not None else 0,
                 predicted_car=float(mean_car) if mean_car is not None else 0.0,
                 basis=f"active cell, holdout hit {hit_pct}",
+                event_id=str(event_id) if event_id is not None else "",
+                hit_rate=float(hit_rate) if hit_rate is not None else None,
+                n_clusters=int(n_clusters) if n_clusters is not None else 0,
+                extraction_confidence=(
+                    float(extraction_confidence) if extraction_confidence is not None else None
+                ),
             )
         )
     return alerts

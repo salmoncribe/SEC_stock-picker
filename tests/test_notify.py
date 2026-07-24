@@ -279,6 +279,8 @@ def test_render_trade_alerts_single_record_has_all_fields() -> None:
     assert "risks $100" in message
     assert "exit by 2026-08-20" in message
     assert "Not auto-traded" in message
+    # Exactly one disclaimer for the whole message, not one per block.
+    assert message.count("Not auto-traded") == 1
 
 
 def test_render_trade_alerts_sorts_highest_confidence_first() -> None:
@@ -300,7 +302,7 @@ def test_render_trade_alerts_unsizeable_record_skips_share_count() -> None:
     assert "sh (" not in message
 
 
-def test_render_trade_alerts_truncates_thirty_records() -> None:
+def test_render_trade_alerts_drops_whole_blocks_past_the_budget() -> None:
     records = [
         _trade_alert_record(alert_id=f"a{i}", ticker=f"TKR{i}", confidence=50 + i)
         for i in range(30)
@@ -309,7 +311,60 @@ def test_render_trade_alerts_truncates_thirty_records() -> None:
     message = render_trade_alerts(records)
 
     assert len(message) <= TELEGRAM_MAX_CHARS
-    assert message.endswith("(truncated)")
+    assert "more in the ledger" in message
+    # The footer appears exactly once, at the end -- not per block.
+    assert message.count("Not auto-traded") == 1
+
+    # The last rendered block must be whole -- every one of its four lines
+    # present, never a mid-block cut.
+    parts = message.split("\n\n")
+    footer_part = parts[-1]
+    last_block = parts[-2]
+    assert "Not auto-traded" in footer_part
+    assert "Why:" in last_block
+    assert "Plan:" in last_block
+    assert "Size:" in last_block
+    assert "exit by 2026-08-20" in last_block
+
+
+def test_render_trade_alerts_uses_four_decimals_under_one_dollar() -> None:
+    plan = _trade_plan(entry_ref=0.85, stop=0.75, target=0.95, atr=0.05)
+    record = _trade_alert_record(plan=plan)
+
+    message = render_trade_alerts([record])
+
+    assert "$0.8500" in message
+    assert "$0.7500" in message
+    assert "$0.9500" in message
+    assert "$0.00" not in message
+
+
+def test_render_trade_alerts_annotates_stop_distance_in_atr_multiples() -> None:
+    # entry 74.20, stop 71.10, atr 1.55 -> exactly 2.0x.
+    message = render_trade_alerts([_trade_alert_record()])
+
+    assert "(2.0×ATR)" in message  # noqa: RUF001 -- deliberate multiplication sign
+
+
+def test_render_trade_alerts_why_line_has_no_doubling_when_event_type_missing() -> None:
+    record = _trade_alert_record(evidence={})
+
+    message = render_trade_alerts([record])
+
+    assert "event event" not in message
+    assert "Why: signal" in message
+
+
+def test_render_trade_alerts_why_line_has_no_dangling_punctuation_or_double_space() -> None:
+    record = _trade_alert_record(
+        evidence={"event_type": "price_gap", "n_clusters": 0}
+    )
+
+    message = render_trade_alerts([record])
+
+    assert "price_gap event;" not in message  # no dangling "; " with empty basis
+    assert "  (n=" not in message  # never a double space before "(n=...)"
+    assert "Why: price_gap event" in message
 
 
 def test_send_trade_alerts_returns_true_and_posts_rendered_text(tmp_config: Config) -> None:

@@ -30,6 +30,7 @@ alert is an actionable ping that deserves its own notification.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -210,21 +211,50 @@ def send(
     return _post_text(config, render_message(briefing), transport=transport)
 
 
+#: The single disclaimer for the whole message -- see ``render_trade_alerts``.
+_TRADE_ALERT_FOOTER = "Not auto-traded — your call."
+
+
 def _kind_label(kind: str) -> str:
     """``"reaction_lag"`` -> ``"reaction lag"``; ``"price_gap"`` -> ``"price gap"``."""
     return kind.replace("_", " ")
+
+
+def _fmt_price(value: float) -> str:
+    """4 decimals under $1 (a nano-cap stop must never round to ``$0.00``), else 2."""
+    return f"{value:.4f}" if abs(value) < 1.0 else f"{value:.2f}"
+
+
+def _stop_annotation(plan: TradePlan) -> str:
+    """``" (m x ATR)"`` -- the stop's distance from entry in ATR units.
+
+    Omitted (empty string) whenever ATR is unusable: zero, negative, or
+    non-finite. That guard also covers a non-finite result of the division
+    itself, so a corrupt ``atr`` can never render a "nan" multiple.
+    """
+    atr = plan.atr
+    if not math.isfinite(atr) or atr <= 0:
+        return ""
+    multiple = abs(plan.entry_ref - plan.stop) / atr
+    if not math.isfinite(multiple):
+        return ""
+    return f" ({multiple:.1f}×ATR)"  # noqa: RUF001 -- deliberate multiplication sign
 
 
 def _why_line(evidence: dict[str, object]) -> str:
     """``"<event_type> event; <basis>"``, plus ``(n=<n_clusters>)`` when known.
 
     Every lookup goes through ``.get`` -- a record whose evidence dict is
-    missing a key (a gap alert with no cell stats, say) must render a plainer
-    line, never raise.
+    missing a key (a gap alert with no cell stats, say) must render a
+    plainer line, never raise. Tidied so a missing/empty field never leaves
+    a visible artifact: no "event event" doubling when ``event_type`` is
+    absent (falls back to the word "signal" instead), no dangling "; " when
+    ``basis`` is empty, and never more than one space before "(n=...)".
     """
-    event_type = evidence.get("event_type") or "event"
-    basis = evidence.get("basis") or ""
-    line = f"{event_type} event; {basis}"
+    event_type = evidence.get("event_type")
+    basis = str(evidence.get("basis") or "").strip()
+    headline = f"{event_type} event" if event_type else "signal"
+    line = f"{headline}; {basis}" if basis else headline
     n_clusters = evidence.get("n_clusters")
     if n_clusters:
         line += f" (n={n_clusters})"
@@ -232,11 +262,12 @@ def _why_line(evidence: dict[str, object]) -> str:
 
 
 def _plan_line(plan: TradePlan) -> str:
-    """``"Plan: entry ~$X · stop $Y · target $Z (+P.P%)"``."""
+    """``"Plan: entry ~$X · stop $Y (m x ATR) · target $Z (+P.P%)"``."""
     target_pct = (plan.target / plan.entry_ref - 1.0) if plan.entry_ref else 0.0
     return (
-        f"Plan: entry ~${plan.entry_ref:.2f} · stop ${plan.stop:.2f} · "
-        f"target ${plan.target:.2f} ({target_pct:+.1%})"
+        f"Plan: entry ~${_fmt_price(plan.entry_ref)} · "
+        f"stop ${_fmt_price(plan.stop)}{_stop_annotation(plan)} · "
+        f"target ${_fmt_price(plan.target)} ({target_pct:+.1%})"
     )
 
 
@@ -254,7 +285,11 @@ def _size_line(plan: TradePlan) -> str:
 
 
 def _trade_alert_block(index: int, record: TradeAlertRecord) -> str:
-    """One numbered alert block: headline, why, plan, size, the disclaimer."""
+    """One numbered alert block: headline, why, plan, size.
+
+    No per-block disclaimer -- ``render_trade_alerts`` carries exactly one
+    ``_TRADE_ALERT_FOOTER`` for the whole message.
+    """
     arrow = _direction_arrow(record.direction)
     lines = [
         f"{index}) {record.ticker} {arrow} {_kind_label(record.kind)} "
@@ -262,7 +297,6 @@ def _trade_alert_block(index: int, record: TradeAlertRecord) -> str:
         f"   Why: {_why_line(record.evidence)}",
         f"   {_plan_line(record.plan)}",
         f"   {_size_line(record.plan)}",
-        "   Not auto-traded — your call.",
     ]
     return "\n".join(lines)
 
@@ -271,14 +305,45 @@ def render_trade_alerts(records: Sequence[TradeAlertRecord]) -> str:
     """Turn fired trade alerts into a plain-text Telegram message (pure, no I/O).
 
     Its own message, separate from the briefing nudge -- see the module
-    docstring. Highest confidence first, one block per alert, truncated under
-    the same ``_SAFE_CHARS`` budget as ``render_message`` so 30 records still
-    fits comfortably under Telegram's ceiling.
+    docstring. Highest confidence first, one block per alert.
+
+    Stays under ``_SAFE_CHARS`` by dropping whole trailing blocks (never a
+    mid-block cut) when a batch would overflow -- the same "cap and note the
+    rest" shape as ``render_message``'s changes/alerts caps, except the cap
+    here is a byte budget rather than a fixed count, because trade-alert
+    blocks vary in length (a gap alert's evidence differs from a reaction-lag
+    alert's). Each candidate block is added only if the message so far, plus
+    the footer, plus room for a "…and N more" line covering everything after
+    it, still fits; the first block is always kept regardless, so a single
+    pathological block cannot empty the message. The raw-slice truncation at
+    the very end is a last-resort guard for that pathological case, not the
+    normal path -- for an ordinary batch, however large, every block that
+    appears is whole.
     """
     ordered = sorted(records, key=lambda r: r.confidence, reverse=True)
     header = f"🎯 TRADE SIGNALS — {len(ordered)} alert(s)"
-    blocks = [_trade_alert_block(i, record) for i, record in enumerate(ordered, start=1)]
-    message = header + "\n\n" + "\n\n".join(blocks)
+
+    kept: list[str] = []
+    for i, record in enumerate(ordered, start=1):
+        block = _trade_alert_block(i, record)
+        remaining_after = len(ordered) - i
+        reserve = len(_TRADE_ALERT_FOOTER) + 2
+        if remaining_after:
+            reserve += len(f"\n…and {remaining_after} more in the ledger.")
+        provisional = "\n\n".join([header, *kept, block])
+        if kept and len(provisional) + reserve > _SAFE_CHARS:
+            break
+        kept.append(block)
+
+    dropped = len(ordered) - len(kept)
+    message = "\n\n".join([header, *kept, _TRADE_ALERT_FOOTER])
+    if dropped:
+        message += f"\n…and {dropped} more in the ledger."
+
+    # Final guard only: normal operation never reaches a mid-block cut,
+    # because the loop above always leaves room for the footer (and the drop
+    # line, when needed). This only fires if a single kept block is itself
+    # too long to fit alongside the header and footer.
     if len(message) > _SAFE_CHARS:
         message = message[: _SAFE_CHARS - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
     return message

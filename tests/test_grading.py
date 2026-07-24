@@ -13,7 +13,9 @@ from typing import Any
 import duckdb
 import pytest
 
+from market_intelligence import database
 from market_intelligence.autopilot import orchestrator
+from market_intelligence.config import Config
 from market_intelligence.signals import grading
 from market_intelligence.storage import duckdb as duckdb_store
 
@@ -196,6 +198,29 @@ class TestLongAlert:
         assert outcome_return is None
         assert graded_at is None
 
+    def test_partial_window_before_exit_date_stays_open_not_expired(self, memory_db):
+        # Bars stop 3 days before the exit date -- a mid-hold delisting or a
+        # provider gap in the tail. as_of is well past the exit date, but
+        # nothing in daily_prices proves the ticker's history ever reached
+        # time_exit_date, so grading must not fabricate an expiry from a
+        # stale last-known close.
+        _seed_alert(memory_db)
+        rows = [_price_row("NKE", FIRED_DATE, open_=100, high=101, low=99, close=100)]
+        d = FIRED_DATE + timedelta(days=1)
+        last_bar_date = EXIT_DATE - timedelta(days=3)
+        while d <= last_bar_date:
+            rows.append(_price_row("NKE", d, open_=100, high=101, low=99, close=101))
+            d += timedelta(days=1)
+        _seed_prices(memory_db, rows)
+
+        counts = grading.grade_open_alerts(memory_db, as_of=EXIT_DATE + timedelta(days=5))
+
+        assert counts == {"hit_stop": 0, "hit_target": 0, "expired": 0, "still_open": 1}
+        outcome, outcome_return, graded_at = _row(memory_db)
+        assert outcome == "open"
+        assert outcome_return is None
+        assert graded_at is None
+
 
 # --------------------------------------------------------------------------- #
 # split-adjusted grading: the whole point of this module                    #
@@ -333,6 +358,65 @@ class TestAlreadyGraded:
         assert outcome == "hit_stop"
         assert outcome_return == pytest.approx(-0.04)
         assert graded_at == stamp
+
+
+# --------------------------------------------------------------------------- #
+# malformed rows: not enough on the row to grade against                    #
+# --------------------------------------------------------------------------- #
+class TestMalformedRow:
+    def test_null_stop_counts_still_open_and_is_untouched(self, memory_db):
+        _seed_alert(memory_db, stop=None)
+        _seed_prices(
+            memory_db,
+            [_price_row("NKE", FIRED_DATE, open_=100, high=101, low=99, close=100)],
+        )
+
+        counts = grading.grade_open_alerts(memory_db, as_of=FIRED_DATE + timedelta(days=5))
+
+        assert counts == {"hit_stop": 0, "hit_target": 0, "expired": 0, "still_open": 1}
+        outcome, outcome_return, graded_at = _row(memory_db)
+        assert outcome == "open"
+        assert outcome_return is None
+        assert graded_at is None
+
+
+# --------------------------------------------------------------------------- #
+# the grade() pipeline-step wrapper                                          #
+# --------------------------------------------------------------------------- #
+class TestGradeWrapper:
+    def test_updated_counts_only_the_terminal_rows(self, tmp_config: Config) -> None:
+        with database.connection(tmp_config.paths.database_path) as con:
+            database.init_db(con)
+            duckdb_store.insert_new_trade_alerts(con, [_alert_row(alert_id="a1")])
+            duckdb_store.insert_new_trade_alerts(
+                con,
+                [
+                    _alert_row(
+                        alert_id="a2", ticker="AAPL", trigger_key="ev2:self:20"
+                    )
+                ],
+            )
+            _seed_prices(
+                con,
+                [
+                    _price_row("NKE", FIRED_DATE, open_=100, high=101, low=99, close=100),
+                    # a1's stop (96) is pierced; a2 (ticker AAPL) has no bars at all yet.
+                    _price_row(
+                        "NKE",
+                        FIRED_DATE + timedelta(days=1),
+                        open_=99,
+                        high=99.5,
+                        low=95,
+                        close=97,
+                    ),
+                ],
+            )
+
+        summary = grading.grade(tmp_config, as_of=FIRED_DATE + timedelta(days=2))
+
+        assert summary.collected == 2  # both open alerts examined
+        assert summary.updated == 1  # only a1 resolved and was written
+        assert summary.stage == {"hit_stop": 1, "hit_target": 0, "expired": 0, "still_open": 1}
 
 
 # --------------------------------------------------------------------------- #

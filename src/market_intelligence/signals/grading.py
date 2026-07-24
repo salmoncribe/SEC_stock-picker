@@ -33,6 +33,24 @@ the planned exit is irrelevant, because the position was already closed by
 then. A row with no bars at all through its exit date is left ``still_open``
 rather than guessed at; grading requires data, not an assumption.
 
+**A partial window must not fabricate an expiry.** ``expired`` is only ever
+finalized when the ticker's price history demonstrably continues on or past
+``time_exit_date`` -- i.e. a bar exists with ``date >= time_exit_date``, not
+merely a bar somewhere before it. Without that, ``as_of >= time_exit_date``
+alone is not proof the exit-date price ever happened: it is equally
+consistent with a mid-hold delisting or a provider gap in the tail, where the
+feed simply stopped a few days early. Grading a stale last-known close as a
+real exit in that case would write a permanent, fabricated outcome onto the
+ledger. So the completeness check looks one step past the exit-bounded
+``relevant`` window (at bars between ``time_exit_date`` and ``as_of``,
+inclusive of the exit date itself) purely to confirm data exists there; the
+close actually used still comes from ``relevant``, i.e. never later than
+``time_exit_date``. When that confirming bar is absent, the row stays
+``still_open`` -- forever, in v1, for a genuinely delisted ticker. That is a
+deliberate trade-off: an honest "insufficient data" beats a fabricated exit
+price. A delisting-aware terminal state (e.g. grading from the last trade
+once a ticker is confirmed delisted) is future work, not this module's job.
+
 Already-graded rows (``outcome != 'open'``) are never re-read here -- the
 ledger's first-firing-wins philosophy extends to grading too: once a row has
 an outcome, it is a historical fact, not something a later run can revise.
@@ -62,6 +80,11 @@ logger = get_logger(__name__)
 #: its return value -- callers can rely on every key being present even when
 #: a run grades nothing of that kind.
 _OUTCOMES: tuple[str, ...] = ("hit_stop", "hit_target", "expired", "still_open")
+
+#: Outcomes that write an UPDATE to the ledger -- everything except
+#: ``still_open``. Shared between the write guard in ``grade_open_alerts``
+#: and the ``summary.updated`` count in ``grade`` so the two never drift.
+_TERMINAL_OUTCOMES: frozenset[str] = frozenset({"hit_stop", "hit_target", "expired"})
 
 
 @dataclass(frozen=True)
@@ -167,10 +190,19 @@ def _grade_one(
             return _GradeResult("hit_target", ret)
 
     if time_exit_date is not None and as_of >= time_exit_date and relevant:
-        last_bar = relevant[-1]
-        close_adj = last_bar.close * _bar_factor(last_bar)
-        ret = direction * (close_adj - entry_adj) / entry_adj
-        return _GradeResult("expired", ret)
+        # Completeness check: the exit-date close is only trustworthy if the
+        # ticker's history demonstrably continues on/past time_exit_date --
+        # otherwise a delisting or a provider gap in the tail is
+        # indistinguishable from a genuine, quiet expiry (see module
+        # docstring). This peeks past `relevant` on purpose; the price used
+        # below still comes only from `relevant` (never later than the exit
+        # date).
+        window_complete = any(b.date >= time_exit_date for b in bars)
+        if window_complete:
+            last_bar = relevant[-1]
+            close_adj = last_bar.close * _bar_factor(last_bar)
+            ret = direction * (close_adj - entry_adj) / entry_adj
+            return _GradeResult("expired", ret)
 
     return _GradeResult("still_open", None)
 
@@ -218,7 +250,7 @@ def grade_open_alerts(con: duckdb.DuckDBPyConnection, as_of: date) -> dict[str, 
             as_of=as_of,
         )
         counts[result.outcome] += 1
-        if result.outcome != "still_open":
+        if result.outcome in _TERMINAL_OUTCOMES:
             con.execute(
                 "UPDATE trade_alerts SET outcome = ?, outcome_return = ?, graded_at = ? "
                 "WHERE alert_id = ?",
@@ -235,13 +267,18 @@ def grade(config: Config, as_of: date | None = None) -> RunSummary:
     outcome counts land in ``summary.stage``; ``summary.collected`` is the
     number of open alerts examined (the sum of those counts), matching the
     house convention that ``collected`` means "offered to this stage", not
-    "changed by it".
+    "changed by it". ``summary.updated`` is the number of rows that actually
+    received a database write -- ``hit_stop`` + ``hit_target`` + ``expired``,
+    per the house ``RunSummary`` contract that ``updated`` means rows
+    modified; ``still_open`` rows are read but never written, so they do not
+    count.
     """
     grading_date = as_of if as_of is not None else datetime.now(tz=UTC).date()
     with pipeline_run(config, "signals.grade-trade-alerts") as (con, summary):
         counts = grade_open_alerts(con, grading_date)
         summary.stage.update(counts)
         summary.collected = sum(counts.values())
+        summary.updated = sum(n for outcome, n in counts.items() if outcome in _TERMINAL_OUTCOMES)
     return summary
 
 

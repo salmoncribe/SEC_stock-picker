@@ -104,6 +104,12 @@ def build_records(
     ``confidence`` uses ``times_asserted=0`` and ``has_track_record=True``:
     a reaction-lag alert is graded on its own cell's holdout history, not on
     how many filings independently asserted the underlying edge.
+
+    Each alert is isolated in its own ``try/except``: the orchestrator can
+    only catch failure at the granularity of the whole call, so one alert
+    whose bars are corrupt, or whose plan math blows up, must not cost the
+    rest of the briefing its records. A failure here is reported the same
+    way a thin-history skip is -- a note naming the ticker -- not raised.
     """
     trading = config.settings.trading
     limit = trading.atr_period * 4
@@ -111,60 +117,72 @@ def build_records(
     notes: list[str] = []
 
     for alert in alerts:
-        bars, invalid = _load_bars(con, alert.ticker, as_of, limit)
-        if invalid:
-            _log.debug("trade_alert_bars_invalid", ticker=alert.ticker, count=invalid)
+        try:
+            if not alert.event_id:
+                _log.warning("trade_alert_event_id_missing", ticker=alert.ticker)
 
-        plan = build_trade_plan(
-            bars=bars,
-            direction=alert.direction,
-            predicted_move=alert.predicted_car,
-            horizon_days=alert.horizon_days,
-            as_of=as_of,
-            account_equity=trading.account_equity,
-            risk_pct_per_trade=trading.risk_pct_per_trade,
-            atr_period=trading.atr_period,
-            atr_stop_multiple=trading.atr_stop_multiple,
-            max_position_pct=trading.max_position_pct,
-        )
-        if plan is None:
-            notes.append(f"trade-alert skipped {alert.ticker}: no viable plan")
-            continue
+            bars, invalid = _load_bars(con, alert.ticker, as_of, limit)
+            if invalid:
+                _log.debug("trade_alert_bars_invalid", ticker=alert.ticker, count=invalid)
 
-        confidence = score(
-            ConfidenceInputs(
-                hit_rate=alert.hit_rate,
-                n_clusters=alert.n_clusters,
-                times_asserted=0,
-                extraction_confidence=alert.extraction_confidence,
-                has_track_record=True,
-            )
-        )
-        evidence = {
-            "event_type": alert.event_type,
-            "event_subtype": alert.event_subtype,
-            "available_on": alert.available_on.isoformat(),
-            "basis": alert.basis,
-            "hit_rate": alert.hit_rate,
-            "n_clusters": alert.n_clusters,
-            "predicted_car": alert.predicted_car,
-            "extraction_confidence": alert.extraction_confidence,
-        }
-        records.append(
-            TradeAlertRecord(
-                alert_id=uuid4().hex,
-                kind="reaction_lag",
-                ticker=alert.ticker,
-                trigger_key=f"{alert.event_id or 'unknown'}:self:{alert.horizon_days}",
-                fired_at=utcnow(),
+            plan = build_trade_plan(
+                bars=bars,
                 direction=alert.direction,
-                plan=plan,
-                confidence=confidence,
-                evidence=evidence,
-                event_id=alert.event_id or None,
-                edge_id="self",
+                predicted_move=alert.predicted_car,
+                horizon_days=alert.horizon_days,
+                as_of=as_of,
+                account_equity=trading.account_equity,
+                risk_pct_per_trade=trading.risk_pct_per_trade,
+                atr_period=trading.atr_period,
+                atr_stop_multiple=trading.atr_stop_multiple,
+                max_position_pct=trading.max_position_pct,
             )
-        )
+            if plan is None:
+                notes.append(f"trade-alert skipped {alert.ticker}: no viable plan")
+                continue
+
+            confidence = score(
+                ConfidenceInputs(
+                    hit_rate=alert.hit_rate,
+                    n_clusters=alert.n_clusters,
+                    times_asserted=0,
+                    extraction_confidence=alert.extraction_confidence,
+                    has_track_record=True,
+                )
+            )
+            evidence = {
+                "event_type": alert.event_type,
+                "event_subtype": alert.event_subtype,
+                "available_on": alert.available_on.isoformat(),
+                "basis": alert.basis,
+                "hit_rate": alert.hit_rate,
+                "n_clusters": alert.n_clusters,
+                "predicted_car": alert.predicted_car,
+                "extraction_confidence": alert.extraction_confidence,
+            }
+            records.append(
+                TradeAlertRecord(
+                    alert_id=uuid4().hex,
+                    kind="reaction_lag",
+                    ticker=alert.ticker,
+                    trigger_key=f"{alert.event_id or 'unknown'}:self:{alert.horizon_days}",
+                    fired_at=utcnow(),
+                    direction=alert.direction,
+                    plan=plan,
+                    confidence=confidence,
+                    evidence=evidence,
+                    event_id=alert.event_id or None,
+                    edge_id="self",
+                )
+            )
+        except Exception as exc:  # one bad ticker must not sink the rest
+            _log.warning(
+                "trade_alert_build_failed",
+                ticker=alert.ticker,
+                error=str(exc),
+            )
+            notes.append(f"trade-alert skipped {alert.ticker}: {type(exc).__name__}: {exc}")
+            continue
 
     return records, notes
 

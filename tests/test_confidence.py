@@ -47,6 +47,25 @@ class TestScore:
             _inputs(extraction_confidence=0.30)
         )
 
+    def test_score_respects_small_n_shrinkage(self):
+        # The one regression the whole contract exists to catch: a reweight
+        # that reads the raw hit rate and forgets to shrink. At hit_rate=0.9,
+        # thin evidence must score below deep evidence, and no evidence must
+        # collapse toward the 50 midpoint.
+        thin = score(_inputs(hit_rate=0.9, n_clusters=2))
+        deep = score(_inputs(hit_rate=0.9, n_clusters=200))
+        none_at_all = score(_inputs(hit_rate=0.9, n_clusters=0))
+        assert thin < deep
+        assert abs(none_at_all - 50) <= 10
+
+    def test_garbage_inputs_cannot_distort_the_bonuses(self):
+        # Negative counts are not anti-evidence; out-of-scale confidences are
+        # clamped to 0..1 before weighting.
+        assert score(_inputs(times_asserted=-100)) == score(_inputs(times_asserted=0))
+        assert score(_inputs(extraction_confidence=25.0)) == score(
+            _inputs(extraction_confidence=1.0)
+        )
+
     def test_no_track_record_is_capped(self):
         s = score(_inputs(has_track_record=False, hit_rate=None, n_clusters=0))
         assert s <= 50

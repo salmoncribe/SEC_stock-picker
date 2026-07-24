@@ -41,9 +41,12 @@ def score(inputs: ConfidenceInputs) -> int:
     base = shrunk_hit_rate(inputs.hit_rate, inputs.n_clusters) * 100.0
 
     # Corroboration bonuses are small on purpose: they refine a measured base,
-    # they must never manufacture confidence a track record didn't earn.
-    edge_bonus = min(inputs.times_asserted, 5) * 1.0
-    extract_bonus = (inputs.extraction_confidence or 0.0) * 5.0
+    # they must never manufacture confidence a track record didn't earn. The
+    # inputs are sanitized to their natural domains first -- these arrive from
+    # nullable DB columns, and a stray NULL or out-of-scale value must distort
+    # nothing (a negative count is not "anti-evidence"; confidence is 0..1).
+    edge_bonus = min(max(inputs.times_asserted or 0, 0), 5) * 1.0
+    extract_bonus = min(1.0, max(0.0, inputs.extraction_confidence or 0.0)) * 5.0
 
     value = base + edge_bonus + extract_bonus
     if not inputs.has_track_record:

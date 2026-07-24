@@ -32,6 +32,7 @@ from market_intelligence.collectors import prices as price_collector
 from market_intelligence.collectors import returns as returns_collector
 from market_intelligence.logging_config import get_logger
 from market_intelligence.signals import dataset as dataset_builder
+from market_intelligence.signals import grading
 from market_intelligence.signals import impact as impact_gate
 from market_intelligence.signals import trade_alerts as trade_alerts_builder
 
@@ -65,12 +66,16 @@ def default_steps() -> list[Step]:
 
     Ordering matters. Prices must land before returns, returns before the
     dataset that reads them, and the dataset before the gate that judges it.
-    The gate is the only critical step -- everything upstream is best-effort
-    enrichment of what it will measure.
+    Grading of yesterday's open alerts runs right after returns, once today's
+    bars exist to grade against, but before the gate -- it is a non-critical
+    housekeeping step, not part of what the gate judges. The gate is the only
+    critical step -- everything upstream is best-effort enrichment of what it
+    will measure.
     """
     return [
         Step("sync-prices", lambda c: price_collector.sync(c)),
         Step("compute-returns", lambda c: returns_collector.compute(c)),
+        Step("grade-trade-alerts", lambda c: grading.grade(c)),
         Step("sync-filing-events", lambda c: filing_events_collector.sync(c)),
         Step("build-dataset", lambda c: dataset_builder.build(c)),
         Step("evaluate", lambda c: impact_gate.evaluate(c), critical=True),

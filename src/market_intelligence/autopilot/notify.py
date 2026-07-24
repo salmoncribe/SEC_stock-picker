@@ -19,11 +19,18 @@ Two design choices follow from that and from testability:
 
 ``render_message`` is split out as a pure ``Briefing -> str`` function: it does
 no I/O, so the message body is unit-testable without a client, a config, or a
-socket.
+socket. Trade alerts (Task 8) get the same treatment: ``render_trade_alerts``
+is a pure ``Sequence[TradeAlertRecord] -> str`` function, and both it and
+``render_message`` share one I/O primitive, ``_post_text`` -- the
+credential-check + POST + logging body that used to live inline in ``send``.
+Trade alerts are deliberately their **own** Telegram message rather than
+folded into the briefing nudge: the briefing stays a status glance, a trade
+alert is an actionable ping that deserves its own notification.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import httpx
@@ -34,6 +41,8 @@ from market_intelligence.logging_config import get_logger
 if TYPE_CHECKING:
     from market_intelligence.autopilot.types import Briefing, EventAlert, SignalChange
     from market_intelligence.config import Config
+    from market_intelligence.signals.trade_alerts import TradeAlertRecord
+    from market_intelligence.signals.trade_plan import TradePlan
 
 logger = get_logger(__name__)
 
@@ -133,18 +142,21 @@ def render_message(briefing: Briefing) -> str:
     return message
 
 
-def send(
+def _post_text(
     config: Config,
-    briefing: Briefing,
+    text: str,
     *,
     transport: httpx.BaseTransport | None = None,
 ) -> bool:
-    """Push a briefing to Telegram; return whether it was delivered.
+    """POST already-rendered text to Telegram; return whether it was delivered.
 
     Never raises: a blank/absent token or chat id, a network error, or a
     non-2xx response each log and return ``False`` so the daily loop survives a
     down notifier. Returns ``True`` only on a 2xx from Telegram. ``transport``
     is injected into the client so tests run against ``httpx.MockTransport``.
+    This is the shared I/O primitive behind both ``send`` (the briefing nudge)
+    and ``send_trade_alerts`` (the trade-alert message) -- credential check,
+    POST, and log event names live here exactly once.
     """
     token = (config.env.telegram_bot_token or "").strip()
     chat_id = (config.env.telegram_chat_id or "").strip()
@@ -155,7 +167,7 @@ def send(
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
-        "text": render_message(briefing),
+        "text": text,
         "disable_web_page_preview": True,
     }
     timeout = httpx.Timeout(
@@ -182,8 +194,118 @@ def send(
     return False
 
 
+def send(
+    config: Config,
+    briefing: Briefing,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> bool:
+    """Push a briefing to Telegram; return whether it was delivered.
+
+    Never raises: a blank/absent token or chat id, a network error, or a
+    non-2xx response each log and return ``False`` so the daily loop survives a
+    down notifier. Returns ``True`` only on a 2xx from Telegram. ``transport``
+    is injected into the client so tests run against ``httpx.MockTransport``.
+    """
+    return _post_text(config, render_message(briefing), transport=transport)
+
+
+def _kind_label(kind: str) -> str:
+    """``"reaction_lag"`` -> ``"reaction lag"``; ``"price_gap"`` -> ``"price gap"``."""
+    return kind.replace("_", " ")
+
+
+def _why_line(evidence: dict[str, object]) -> str:
+    """``"<event_type> event; <basis>"``, plus ``(n=<n_clusters>)`` when known.
+
+    Every lookup goes through ``.get`` -- a record whose evidence dict is
+    missing a key (a gap alert with no cell stats, say) must render a plainer
+    line, never raise.
+    """
+    event_type = evidence.get("event_type") or "event"
+    basis = evidence.get("basis") or ""
+    line = f"{event_type} event; {basis}"
+    n_clusters = evidence.get("n_clusters")
+    if n_clusters:
+        line += f" (n={n_clusters})"
+    return line
+
+
+def _plan_line(plan: TradePlan) -> str:
+    """``"Plan: entry ~$X · stop $Y · target $Z (+P.P%)"``."""
+    target_pct = (plan.target / plan.entry_ref - 1.0) if plan.entry_ref else 0.0
+    return (
+        f"Plan: entry ~${plan.entry_ref:.2f} · stop ${plan.stop:.2f} · "
+        f"target ${plan.target:.2f} ({target_pct:+.1%})"
+    )
+
+
+def _size_line(plan: TradePlan) -> str:
+    """The Size line, or the unsizeable variant when the account can't fund a share."""
+    if plan.unsizeable:
+        return (
+            "Size: unsizeable at current risk settings · "
+            f"exit by {plan.time_exit_date.isoformat()}"
+        )
+    return (
+        f"Size: {plan.shares} sh (~${plan.notional:,.0f} → risks ${plan.risk_amount:,.0f}) "
+        f"· exit by {plan.time_exit_date.isoformat()}"
+    )
+
+
+def _trade_alert_block(index: int, record: TradeAlertRecord) -> str:
+    """One numbered alert block: headline, why, plan, size, the disclaimer."""
+    arrow = _direction_arrow(record.direction)
+    lines = [
+        f"{index}) {record.ticker} {arrow} {_kind_label(record.kind)} "
+        f"(confidence {record.confidence})",
+        f"   Why: {_why_line(record.evidence)}",
+        f"   {_plan_line(record.plan)}",
+        f"   {_size_line(record.plan)}",
+        "   Not auto-traded — your call.",
+    ]
+    return "\n".join(lines)
+
+
+def render_trade_alerts(records: Sequence[TradeAlertRecord]) -> str:
+    """Turn fired trade alerts into a plain-text Telegram message (pure, no I/O).
+
+    Its own message, separate from the briefing nudge -- see the module
+    docstring. Highest confidence first, one block per alert, truncated under
+    the same ``_SAFE_CHARS`` budget as ``render_message`` so 30 records still
+    fits comfortably under Telegram's ceiling.
+    """
+    ordered = sorted(records, key=lambda r: r.confidence, reverse=True)
+    header = f"🎯 TRADE SIGNALS — {len(ordered)} alert(s)"
+    blocks = [_trade_alert_block(i, record) for i, record in enumerate(ordered, start=1)]
+    message = header + "\n\n" + "\n\n".join(blocks)
+    if len(message) > _SAFE_CHARS:
+        message = message[: _SAFE_CHARS - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+    return message
+
+
+def send_trade_alerts(
+    config: Config,
+    records: Sequence[TradeAlertRecord],
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> bool:
+    """Render and push trade alerts as their own Telegram message.
+
+    An empty ``records`` sequence returns ``False`` without touching the
+    network -- there is nothing to say, and a "0 alert(s)" ping would just be
+    noise. Otherwise behaves exactly like ``send``: never raises, ``True``
+    only on a 2xx.
+    """
+    if not records:
+        return False
+    return _post_text(config, render_trade_alerts(records), transport=transport)
+
+
 __all__ = [
     "TELEGRAM_MAX_CHARS",
     "render_message",
+    "render_trade_alerts",
     "send",
+    "send_trade_alerts",
 ]

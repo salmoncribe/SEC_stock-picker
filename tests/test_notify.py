@@ -8,14 +8,17 @@ whatever Telegram (or the config) does.
 
 from __future__ import annotations
 
-from datetime import date
+import json
+from datetime import date, datetime
 
 import httpx
 
 from market_intelligence.autopilot.notify import (
     TELEGRAM_MAX_CHARS,
     render_message,
+    render_trade_alerts,
     send,
+    send_trade_alerts,
 )
 from market_intelligence.autopilot.types import (
     Briefing,
@@ -25,6 +28,8 @@ from market_intelligence.autopilot.types import (
     SignalChange,
 )
 from market_intelligence.config import Config
+from market_intelligence.signals.trade_alerts import TradeAlertRecord
+from market_intelligence.signals.trade_plan import TradePlan
 
 
 def _activated_change() -> SignalChange:
@@ -208,3 +213,167 @@ def test_send_returns_false_on_connect_error(tmp_config: Config) -> None:
     result = send(config, _briefing(), transport=transport)
 
     assert result is False
+
+
+# --------------------------------------------------------------------------- #
+# render_trade_alerts / send_trade_alerts                                     #
+# --------------------------------------------------------------------------- #
+def _trade_plan(**overrides: object) -> TradePlan:
+    base: dict[str, object] = {
+        "entry_ref": 74.20,
+        "stop": 71.10,
+        "target": 76.40,
+        "shares": 13,
+        "notional": 964.60,
+        "risk_amount": 100.0,
+        "time_exit_date": date(2026, 8, 20),
+        "atr": 1.55,
+        "unsizeable": False,
+    }
+    base.update(overrides)
+    return TradePlan(**base)  # type: ignore[arg-type]
+
+
+def _trade_alert_record(
+    *, plan: TradePlan | None = None, **overrides: object
+) -> TradeAlertRecord:
+    base: dict[str, object] = {
+        "alert_id": "a1",
+        "kind": "reaction_lag",
+        "ticker": "NKE",
+        "trigger_key": "ev1:self:20",
+        "fired_at": datetime(2026, 7, 22, 9, 0),
+        "direction": 1,
+        "plan": plan or _trade_plan(),
+        "confidence": 72,
+        "evidence": {
+            "event_type": "insider_transaction",
+            "event_subtype": "P",
+            "basis": "active cell, holdout hit 58.8%",
+            "hit_rate": 0.588,
+            "n_clusters": 41,
+        },
+        "event_id": "ev1",
+        "edge_id": "self",
+    }
+    base.update(overrides)
+    return TradeAlertRecord(**base)  # type: ignore[arg-type]
+
+
+def test_render_trade_alerts_single_record_has_all_fields() -> None:
+    message = render_trade_alerts([_trade_alert_record()])
+
+    assert "TRADE SIGNALS" in message
+    assert "NKE ↑" in message
+    assert "confidence 72" in message
+    assert "Why:" in message
+    assert "insider_transaction" in message
+    assert "active cell, holdout hit 58.8%" in message
+    assert "n=41" in message
+    assert "Plan:" in message
+    assert "$74.20" in message
+    assert "$71.10" in message
+    assert "$76.40" in message
+    assert "Size:" in message
+    assert "13 sh" in message
+    assert "risks $100" in message
+    assert "exit by 2026-08-20" in message
+    assert "Not auto-traded" in message
+
+
+def test_render_trade_alerts_sorts_highest_confidence_first() -> None:
+    low = _trade_alert_record(alert_id="a-low", ticker="LOW", confidence=40)
+    high = _trade_alert_record(alert_id="a-high", ticker="HIGH", confidence=90)
+
+    message = render_trade_alerts([low, high])
+
+    assert message.index("HIGH") < message.index("LOW")
+
+
+def test_render_trade_alerts_unsizeable_record_skips_share_count() -> None:
+    plan = _trade_plan(shares=0, notional=0.0, risk_amount=0.0, unsizeable=True)
+    record = _trade_alert_record(plan=plan)
+
+    message = render_trade_alerts([record])
+
+    assert "unsizeable at current risk settings" in message
+    assert "sh (" not in message
+
+
+def test_render_trade_alerts_truncates_thirty_records() -> None:
+    records = [
+        _trade_alert_record(alert_id=f"a{i}", ticker=f"TKR{i}", confidence=50 + i)
+        for i in range(30)
+    ]
+
+    message = render_trade_alerts(records)
+
+    assert len(message) <= TELEGRAM_MAX_CHARS
+    assert message.endswith("(truncated)")
+
+
+def test_send_trade_alerts_returns_true_and_posts_rendered_text(tmp_config: Config) -> None:
+    config = _with_creds(tmp_config, token="bot-token-123", chat_id="99887766")
+    records = [_trade_alert_record()]
+    expected_text = render_trade_alerts(records)
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(handler)
+    result = send_trade_alerts(config, records, transport=transport)
+
+    assert result is True
+    assert captured["url"] == "https://api.telegram.org/botbot-token-123/sendMessage"
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert body["text"] == expected_text
+
+
+def test_send_trade_alerts_returns_false_on_500(tmp_config: Config) -> None:
+    config = _with_creds(tmp_config, token="bot-token-123", chat_id="99887766")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="internal error")
+
+    transport = httpx.MockTransport(handler)
+    result = send_trade_alerts(config, [_trade_alert_record()], transport=transport)
+
+    assert result is False
+
+
+def test_send_trade_alerts_returns_false_when_creds_missing_and_makes_no_call(
+    tmp_config: Config,
+) -> None:
+    config = _with_creds(tmp_config, token=None, chat_id="99887766")
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(handler)
+    result = send_trade_alerts(config, [_trade_alert_record()], transport=transport)
+
+    assert result is False
+    assert calls["count"] == 0
+
+
+def test_send_trade_alerts_returns_false_for_empty_records_and_makes_no_call(
+    tmp_config: Config,
+) -> None:
+    config = _with_creds(tmp_config, token="bot-token-123", chat_id="99887766")
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(handler)
+    result = send_trade_alerts(config, [], transport=transport)
+
+    assert result is False
+    assert calls["count"] == 0

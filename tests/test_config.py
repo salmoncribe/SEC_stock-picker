@@ -127,6 +127,7 @@ class TestGapScannerConfig:
         assert g.gap_max_hold_days == 5
         assert g.gap_catalyst_lookback_days == 7
         assert g.require_catalyst is False
+        assert g.min_confidence == 40
 
     def test_yaml_values_load(self, tmp_config: Config) -> None:
         g = tmp_config.settings.gap_scanner
@@ -136,3 +137,12 @@ class TestGapScannerConfig:
         assert g.gap_max_hold_days >= 1
         assert g.gap_catalyst_lookback_days >= 1
         assert g.require_catalyst in (True, False)
+        assert 0 <= g.min_confidence <= 100
+
+    def test_min_confidence_below_trading_floor_is_the_point(self) -> None:
+        """Gap alerts cap at confidence 50 (no track record yet); this floor
+        must sit below that cap, unlike ``trading.min_confidence`` (60 by
+        default), or gap alerts would never clear the gate to text."""
+        g = GapScannerConfig()
+        assert g.min_confidence < 50
+        assert g.min_confidence < TradingConfig().min_confidence

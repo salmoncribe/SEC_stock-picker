@@ -146,6 +146,13 @@ class GapScannerConfig(BaseModel):
     entry-to-stop distance. ``require_catalyst`` defaults to False so the
     scanner also surfaces unexplained gaps (no confirmed news event) rather
     than only catalyst-backed ones — Michael reviews those manually.
+
+    ``min_confidence`` is separate from ``trading.min_confidence`` on purpose:
+    gap alerts carry no track record yet and cap at confidence 50 (see
+    ``signals.confidence`` / ``collectors.gaps``), so gating them against the
+    daily path's floor (60 by default) would mean they never text. This floor
+    lets them text anyway — raise it to 60+ to silence gap alerts entirely
+    until the ledger matures enough to lift the cap.
     """
 
     min_gap_pct: float = Field(default=3.0, gt=0.0)
@@ -154,6 +161,7 @@ class GapScannerConfig(BaseModel):
     gap_max_hold_days: int = Field(default=5, ge=1)
     gap_catalyst_lookback_days: int = Field(default=7, ge=1)
     require_catalyst: bool = False
+    min_confidence: int = Field(default=40, ge=0, le=100)
 
 
 class SettingsFile(BaseModel):

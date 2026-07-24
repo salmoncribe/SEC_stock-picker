@@ -67,3 +67,6 @@ gap_scanner:
   gap_max_hold_days: 5
   gap_catalyst_lookback_days: 7
   require_catalyst: false
+  # gap alerts carry no track record yet and cap at confidence 50; this floor
+  # lets them text anyway — raise to 60+ to silence them until the ledger matures
+  min_confidence: 40

@@ -5,7 +5,8 @@ with a purpose-built stub ``MarketDataProvider`` -- nothing touches the
 network, the real yfinance provider, or the real database. Config defaults
 (``trading``/``gap_scanner``) come straight from ``config/settings.yaml``:
 ``min_gap_pct=3.0``, ``atr_period=14``, ``atr_stop_multiple=2.0``,
-``gap_target_r_multiple=2.0``, ``min_confidence=60``.
+``gap_target_r_multiple=2.0``, ``trading.min_confidence=60``,
+``gap_scanner.min_confidence=40``.
 """
 
 from __future__ import annotations
@@ -244,6 +245,25 @@ def test_illiquid_gapper_is_dropped(tmp_config: Config) -> None:
     assert summary.stage.get("gap_scan_illiquid", 0) == 1
 
 
+def test_stale_history_is_skipped(tmp_config: Config) -> None:
+    """A prior bar more than 4 calendar days old is a lagging price sync,
+    not an overnight gap -- the ticker never reaches the quote-fetch phase."""
+    n = tmp_config.settings.trading.atr_period * 4
+    end = AS_OF - timedelta(days=6)  # bars end 6 days before as_of -> stale
+    _seed_constituents(tmp_config, ["STALEX"])
+    _seed_prices(tmp_config, "STALEX", end=end, n=n)
+
+    provider = _StubProvider({})  # never called: filtered out before phase (b)
+
+    summary = gaps.scan(tmp_config, provider=provider, as_of=AS_OF, notify=False)
+
+    assert _trade_alert_rows(tmp_config) == []
+    assert summary.stage.get("gap_scan_stale_history", 0) == 1
+    # Proof it was filtered in the read phase, not merely errored in the
+    # quote phase: the stub was never asked for a quote at all.
+    assert summary.stage.get("gap_scan_provider_error", 0) == 0
+
+
 def test_require_catalyst_gates_until_an_event_is_seeded(
     tmp_config: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -350,8 +370,11 @@ def test_notify_false_never_calls_send(
 ) -> None:
     # Force the record to be sendable regardless of the no-track-record cap,
     # so this test actually exercises the notify=False guard rather than
-    # relying on gating to make send() unreachable anyway.
-    tmp_config.settings.trading.min_confidence = 0
+    # relying on gating to make send() unreachable anyway. Uses the gap
+    # path's own floor (gap_scanner.min_confidence), not trading's -- see
+    # test_qualifying_gap_is_sendable_under_default_config for why they
+    # differ.
+    tmp_config.settings.gap_scanner.min_confidence = 0
     n = tmp_config.settings.trading.atr_period * 4
     end = AS_OF - timedelta(days=1)
     _seed_constituents(tmp_config, ["GAPX"])
@@ -371,3 +394,80 @@ def test_notify_false_never_calls_send(
     assert len(rows_out) == 1
     assert rows_out[0]["delivered"] is False
     assert rows_out[0]["delivery_note"] is None
+
+
+def test_qualifying_gap_is_sendable_under_default_config(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gap confidence caps at 50 (no track record yet); trading.min_confidence
+    defaults to 60, so without its own floor a gap alert would NEVER clear
+    the gate to text. gap_scanner.min_confidence defaults to 40, below the
+    cap, so a qualifying gap is sendable out of the box -- no overrides."""
+    n = tmp_config.settings.trading.atr_period * 4
+    end = AS_OF - timedelta(days=1)
+    _seed_constituents(tmp_config, ["GAPX"])
+    rows = _seed_prices(tmp_config, "GAPX", end=end, n=n)
+    quote = rows[-1]["close"] * 1.05
+    provider = _StubProvider({"GAPX": LatestPrice(symbol="GAPX", price=quote, as_of=AS_OF)})
+
+    captured: dict[str, Any] = {}
+
+    def fake_send(_config: Config, records: Any) -> bool:
+        captured["records"] = list(records)
+        return True
+
+    monkeypatch.setattr(notify, "send_trade_alerts", fake_send)
+
+    summary = gaps.scan(tmp_config, provider=provider, as_of=AS_OF, notify=True)
+
+    assert summary.status == "success"
+    assert captured.get("records")
+    assert len(captured["records"]) == 1
+    assert captured["records"][0].confidence >= tmp_config.settings.gap_scanner.min_confidence
+    assert captured["records"][0].confidence < tmp_config.settings.trading.min_confidence
+
+
+def test_quote_fetch_paces_between_calls(tmp_config: Config) -> None:
+    n = tmp_config.settings.trading.atr_period * 4
+    end = AS_OF - timedelta(days=1)
+    tickers = ["A", "B", "C"]
+    _seed_constituents(tmp_config, tickers)
+    quotes: dict[str, LatestPrice] = {}
+    for i, ticker in enumerate(tickers):
+        rows = _seed_prices(tmp_config, ticker, end=end, n=n, start_close=100.0 + i * 10)
+        # No gap -- these are filtered downstream; pacing only cares about
+        # how many quote calls were attempted, not the outcome.
+        quotes[ticker] = LatestPrice(symbol=ticker, price=rows[-1]["close"], as_of=AS_OF)
+    provider = _StubProvider(quotes)
+
+    sleep_calls: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    gaps.scan(tmp_config, provider=provider, as_of=AS_OF, notify=False, sleep=fake_sleep)
+
+    quote_pauses = [s for s in sleep_calls if s == pytest.approx(0.15)]
+    # 3 survivors -> pauses between calls, not before/after -> len - 1.
+    assert len(quote_pauses) == len(tickers) - 1
+    assert len(quote_pauses) >= 1
+
+
+def test_provider_errors_over_half_marks_run_partial(tmp_config: Config) -> None:
+    n = tmp_config.settings.trading.atr_period * 4
+    end = AS_OF - timedelta(days=1)
+    tickers = ["A", "B", "C"]
+    _seed_constituents(tmp_config, tickers)
+    for i, ticker in enumerate(tickers):
+        _seed_prices(tmp_config, ticker, end=end, n=n, start_close=100.0 + i * 10)
+
+    provider = _StubProvider(
+        {"A": LatestPrice(symbol="A", price=100.0, as_of=AS_OF)},
+        raise_for={"B", "C"},  # 2 of 3 attempted quotes fail -> > half
+    )
+
+    summary = gaps.scan(tmp_config, provider=provider, as_of=AS_OF, notify=False)
+
+    assert summary.status == "partial"
+    assert summary.stage.get("gap_scan_provider_error", 0) == 2
+    assert any("gap_scan_degraded" in note for note in summary.notes)

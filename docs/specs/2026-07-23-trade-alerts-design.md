@@ -122,7 +122,9 @@ Columns: `alert_id` (PK), `fired_at`, `kind` (`reaction_lag|price_gap`), `ticker
 `time_exit_date`, `confidence`, `evidence` (JSON: filing quotes, event ids, cell stats,
 gap metrics), `event_id`/`edge_id` (nullable, daily path), `delivered` (bool),
 `delivery_note` (nullable: `gated_below_min_confidence|telegram_failed`),
-`outcome` (`open|hit_stop|hit_target|expired`), `outcome_return`, `graded_at`.
+`outcome` (`open|hit_stop|hit_target|expired`), `outcome_return`, `graded_at`,
+`unsizeable` (bool — the account couldn't fund even one share at the configured
+risk; the alert still fires with the geometry, flagged).
 
 This table **supersedes** the `alerts` table designed (but never built) in the
 signal-graph spec §4: same purpose — persist fired predictions and backfill outcomes —

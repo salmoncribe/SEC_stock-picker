@@ -189,6 +189,79 @@ def test_non_db_marker_still_evaluated_when_lock_holder_unknown() -> None:
     assert [c.pid for c in candidates] == [20]
 
 
+def test_wrapper_and_its_child_are_one_launch_not_duplicates() -> None:
+    # `uv run market-intelligence ...` shows up as TWO processes -- the uv
+    # wrapper and the python worker it spawned -- and both command lines match
+    # the same marker. On 2026-07-23 the guard killed the live extractor's
+    # worker exactly this way (exit 143). A parent/child chain is one launch,
+    # never a duplicate pair.
+    processes = [
+        _proc(10, 1, "uv run market-intelligence signals extract-relationships", etime_seconds=600),
+        _proc(
+            11,
+            10,
+            "python .venv/bin/market-intelligence signals extract-relationships",
+            etime_seconds=598,
+        ),
+    ]
+    protected = _protected_pids(processes, own_pid=99999)
+    candidates = ram_guard.find_kill_candidates(processes, protected=protected, lock_holders=set())
+    assert candidates == []
+
+
+def test_chain_through_a_non_matching_shell_still_collapses() -> None:
+    # wrapper -> zsh (no marker) -> worker: ancestry walks the full process
+    # table, so an intermediate non-matching shell doesn't break the chain.
+    processes = [
+        _proc(10, 1, "uv run market-intelligence sec ingest-documents", etime_seconds=600),
+        _proc(11, 10, "zsh -c real-work", etime_seconds=599),
+        _proc(
+            12, 11, "python .venv/bin/market-intelligence sec ingest-documents", etime_seconds=598
+        ),
+    ]
+    protected = _protected_pids(processes, own_pid=99999)
+    candidates = ram_guard.find_kill_candidates(processes, protected=protected, lock_holders=set())
+    assert candidates == []
+
+
+def test_two_unrelated_launch_trees_yield_one_candidate() -> None:
+    # Two independent wrapper+child trees ARE duplicates. Exactly one
+    # candidate: the younger tree's root -- killing the wrapper takes that
+    # launch down as a unit, and the survivor tree is untouched.
+    processes = [
+        _proc(10, 1, "uv run market-intelligence sec ingest-documents", etime_seconds=7200),
+        _proc(
+            11, 10, "python .venv/bin/market-intelligence sec ingest-documents", etime_seconds=7199
+        ),
+        _proc(20, 1, "uv run market-intelligence sec ingest-documents", etime_seconds=60),
+        _proc(
+            21, 20, "python .venv/bin/market-intelligence sec ingest-documents", etime_seconds=59
+        ),
+    ]
+    protected = _protected_pids(processes, own_pid=99999)
+    candidates = ram_guard.find_kill_candidates(processes, protected=protected, lock_holders=set())
+    assert [c.pid for c in candidates] == [20]
+
+
+def test_lock_held_by_a_child_protects_its_whole_tree() -> None:
+    # The younger tree's WORKER holds the DuckDB lock. Lock protection must
+    # apply to the whole launch tree, so the older tree's root is the one
+    # candidate -- the age heuristic alone would have doomed the young worker.
+    processes = [
+        _proc(10, 1, "uv run market-intelligence sec ingest-documents", etime_seconds=7200),
+        _proc(
+            11, 10, "python .venv/bin/market-intelligence sec ingest-documents", etime_seconds=7199
+        ),
+        _proc(20, 1, "uv run market-intelligence sec ingest-documents", etime_seconds=60),
+        _proc(
+            21, 20, "python .venv/bin/market-intelligence sec ingest-documents", etime_seconds=59
+        ),
+    ]
+    protected = _protected_pids(processes, own_pid=99999)
+    candidates = ram_guard.find_kill_candidates(processes, protected=protected, lock_holders={21})
+    assert [c.pid for c in candidates] == [10]
+
+
 def test_unrelated_duplicate_helper_processes_are_ignored() -> None:
     # e.g. VS Code / Electron renderer helpers -- not a recognized marker, so
     # never a candidate no matter how many copies are running.

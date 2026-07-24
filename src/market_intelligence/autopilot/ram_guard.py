@@ -280,40 +280,84 @@ def _duplicate_groups(
     return {marker: procs for marker, procs in groups.items() if len(procs) > 1}
 
 
+def _chain_root_pid(proc: ProcessInfo, by_pid: dict[int, int], group_pids: set[int]) -> int:
+    """The topmost same-marker ancestor of ``proc``, or ``proc`` itself.
+
+    Walks the full process table, so a chain survives an intermediate
+    non-matching process (``uv`` wrapper -> ``zsh -c`` -> python worker). The
+    walk is cycle-guarded because ``ps`` snapshots can contain reused pids.
+    """
+    root = proc.pid
+    seen: set[int] = set()
+    current = proc.ppid
+    while current > 1 and current not in seen:
+        if current in group_pids:
+            root = current
+        seen.add(current)
+        parent = by_pid.get(current)
+        if parent is None:
+            break
+        current = parent
+    return root
+
+
 def find_kill_candidates(
     processes: list[ProcessInfo],
     *,
     protected: set[int],
     lock_holders: set[int] | None,
 ) -> list[KilledProcess]:
-    """Duplicate copies of a singleton command, the real one kept, rest flagged.
+    """Duplicate *launches* of a singleton command, the real one kept, rest flagged.
 
-    Whichever duplicate actually holds the DuckDB lock is always the one kept
-    -- that's certain knowledge, not a guess. Only when nothing in the group
-    holds the lock (ollama, or a DB-touching command that isn't mid-write right
-    now) does it fall back to keeping the longest-running one, on the theory
-    that an accidental re-launch is almost always the newer copy. A DB-touching
-    marker is skipped entirely if ``lock_holders`` is unknown (lsof failed) --
-    better to leave a real duplicate alone than guess wrong on a live backfill.
+    A single launch is often several matching processes: ``uv run
+    market-intelligence ...`` is a wrapper plus the python worker it spawned,
+    and both command lines match the same marker. Treating that pair as
+    duplicates is how the guard killed the live extractor's worker on
+    2026-07-23 -- so matching processes are first collapsed into launch trees
+    by ancestry, and only distinct trees count as duplicates. The kill target
+    for a losing tree is its root (stopping the wrapper stops the launch); a
+    child orphaned by a SIGKILLed root becomes its own root on the next pass.
+
+    Whichever tree holds the DuckDB lock -- via *any* of its processes -- is
+    always the one kept; that's certain knowledge, not a guess. Only when no
+    tree holds the lock (ollama, or a DB-touching command that isn't mid-write
+    right now) does it fall back to keeping the longest-running root, on the
+    theory that an accidental re-launch is almost always the newer copy. A
+    DB-touching marker is skipped entirely if ``lock_holders`` is unknown
+    (lsof failed) -- better to leave a real duplicate alone than guess wrong
+    on a live backfill.
     """
     candidates: list[KilledProcess] = []
+    by_pid = {p.pid: p.ppid for p in processes}
     for marker, group in _duplicate_groups(processes, protected).items():
         if marker in _DB_TOUCHING_MARKERS and lock_holders is None:
             continue
-        holding = [p for p in group if lock_holders and p.pid in lock_holders]
-        if holding:
-            keep_pids = {p.pid for p in holding}
-        else:
-            survivor = max(group, key=lambda p: p.etime_seconds)
-            keep_pids = {survivor.pid}
+        group_pids = {p.pid for p in group}
+        chains: dict[int, list[ProcessInfo]] = {}
         for proc in group:
-            if proc.pid in keep_pids:
+            chains.setdefault(_chain_root_pid(proc, by_pid, group_pids), []).append(proc)
+        if len(chains) <= 1:
+            continue  # one launch tree: a wrapper and its own workers
+
+        roots = {p.pid: p for p in group if p.pid in chains}
+        holding_roots = [
+            root_pid
+            for root_pid, members in chains.items()
+            if lock_holders and any(m.pid in lock_holders for m in members)
+        ]
+        if holding_roots:
+            keep_roots = set(holding_roots)
+        else:
+            survivor = max(roots.values(), key=lambda p: p.etime_seconds)
+            keep_roots = {survivor.pid}
+        for root_pid, root in sorted(roots.items()):
+            if root_pid in keep_roots:
                 continue
             candidates.append(
                 KilledProcess(
-                    pid=proc.pid,
-                    command=proc.command,
-                    rss_mb=proc.rss_mb,
+                    pid=root.pid,
+                    command=root.command,
+                    rss_mb=root.rss_mb,
                     marker=marker,
                     signal_used="",
                 )

@@ -173,6 +173,9 @@ gap_scanner:
   gap_max_hold_days: 5
   gap_catalyst_lookback_days: 7    # events within this window count as the gap's catalyst
   require_catalyst: false      # true → only gaps explained by an event are texted
+  min_confidence: 40           # gap alerts cap at 50 (no track record yet); this
+                               # separate floor lets them text anyway — raise to
+                               # 60+ to silence gaps until the ledger matures
 ```
 
 Defaults are placeholders to make the pipeline runnable; the user owns every value.

@@ -38,6 +38,25 @@ def _isolate_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(EnvSettings.model_config, "env_file", None)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_ram_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests must never probe or signal the real machine.
+
+    ``orchestrator.run`` begins with the RAM guard, which shells out to the
+    real ``memory_pressure``/``ps``/``lsof`` and, under genuine memory
+    pressure, SIGTERMs real processes. On 2026-07-23 a full-suite run did
+    exactly that to the live relationship extractor: the guard saw the
+    extractor's ``uv`` wrapper and its python child as "duplicates", checked
+    the lock against the *test's* tmp database instead of the real one, and
+    killed the worker (exit 143). Orchestrator tests get a no-op here; the
+    guard's own tests exercise ``run_guard`` directly with injected fakes and
+    are unaffected.
+    """
+    monkeypatch.setattr(
+        "market_intelligence.autopilot.orchestrator._check_ram", lambda config: []
+    )
+
+
 @pytest.fixture
 def fixtures_dir() -> Path:
     return FIXTURES_DIR

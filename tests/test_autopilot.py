@@ -383,6 +383,26 @@ def test_a_sent_alert_is_stamped_delivered(
     assert rows[0][2] is True  # delivered
 
 
+def test_a_failed_send_is_stamped_not_delivered(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Persist-before-send: a send that comes back False still leaves the
+    row on the ledger, just marked honestly as not delivered."""
+    _seed_alertable_cell(tmp_config)
+
+    def fake_send(_config: Config, records: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(notify, "send_trade_alerts", fake_send)
+
+    orchestrator.run(tmp_config, as_of=AS_OF, steps=[])
+
+    rows = _trade_alert_rows(tmp_config)
+    assert len(rows) == 1
+    assert rows[0][2] is False  # delivered
+    assert rows[0][3] == "telegram_failed"  # delivery_note
+
+
 def test_a_gated_alert_is_never_sent(
     tmp_config: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:

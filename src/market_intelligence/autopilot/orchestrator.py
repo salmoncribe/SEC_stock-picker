@@ -36,6 +36,8 @@ from market_intelligence.signals import impact as impact_gate
 from market_intelligence.signals import trade_alerts as trade_alerts_builder
 
 if TYPE_CHECKING:
+    import duckdb
+
     from market_intelligence.collectors import RunSummary
     from market_intelligence.config import Config
 
@@ -113,6 +115,61 @@ def _check_ram(config: Config) -> list[str]:
     return [result.summary_line]
 
 
+def _project_trade_alerts(
+    con: duckdb.DuckDBPyConnection,
+    briefing: Briefing,
+    config: Config,
+    as_of: date,
+) -> list[trade_alerts_builder.TradeAlertRecord]:
+    """Build, persist, and gate today's fired alerts; return the sendable ones.
+
+    Best-effort like every other tail of the loop -- a broken plan/persist
+    step must not cost the briefing that already succeeded, it only earns a
+    note. Skip-notes from ``build_records`` are appended onto the briefing's
+    own (mutable) ``notes`` list in place, not returned separately, so both
+    the Obsidian note and the Telegram nudge see them.
+    """
+    try:
+        records, ta_notes = trade_alerts_builder.build_records(
+            con, briefing.alerts, config, as_of=as_of
+        )
+        briefing.notes.extend(ta_notes)
+        new_records = trade_alerts_builder.persist_new(
+            con, records, schema_version=config.settings.app.schema_version
+        )
+        min_conf = config.settings.trading.min_confidence
+        sendable_records = trade_alerts_builder.sendable(new_records, min_conf)
+        trade_alerts_builder.mark_gated(con, trade_alerts_builder.gated(new_records, min_conf))
+        return sendable_records
+    except Exception as exc:  # the ledger must not sink the briefing
+        logger.error("autopilot_trade_alerts_failed", error=str(exc))
+        briefing.notes.append(f"step trade-alerts FAILED: {exc}")
+        return []
+
+
+def _send_trade_alerts(
+    config: Config, records: list[trade_alerts_builder.TradeAlertRecord]
+) -> None:
+    """Push sendable alerts to Telegram, then stamp the ledger; never raise.
+
+    Persist-before-send: ``_project_trade_alerts`` already committed these
+    rows, so a crash here can only under-report delivery, never lose a
+    record. One asymmetry is deliberate and worth naming: a process death
+    between a successful send and this stamp leaves ``delivered=False``
+    forever (first-firing-wins means the row is never re-offered), even
+    though the message actually reached Telegram -- a stale False, not a
+    phantom resend, which is the safer direction to be wrong in.
+    """
+    if not records:
+        return
+    sent = notify.send_trade_alerts(config, records)
+    try:
+        with database.connection(config.paths.database_path) as con:
+            trade_alerts_builder.mark_delivered(con, records, delivered=sent)
+    except Exception as exc:  # a failed stamp must not affect the return value
+        logger.error("autopilot_trade_alerts_stamp_failed", error=str(exc))
+
+
 def run(
     config: Config,
     *,
@@ -171,39 +228,10 @@ def run(
             before=before,
             notes=notes,
         )
-
-        # Project today's fired alerts into the trade-alert ledger: build a
-        # plan + confidence for each, persist the first-firing-wins rows, and
-        # gate anything under the confidence floor. Best-effort like every
-        # other tail of the loop -- a broken plan/persist step must not cost
-        # the briefing that already succeeded, it only earns a note.
-        sendable_records: list[trade_alerts_builder.TradeAlertRecord] = []
-        try:
-            records, ta_notes = trade_alerts_builder.build_records(
-                con, briefing.alerts, config, as_of=briefing_date
-            )
-            briefing.notes.extend(ta_notes)
-            new_records = trade_alerts_builder.persist_new(
-                con, records, schema_version=config.settings.app.schema_version
-            )
-            min_conf = config.settings.trading.min_confidence
-            sendable_records = trade_alerts_builder.sendable(new_records, min_conf)
-            trade_alerts_builder.mark_gated(
-                con, trade_alerts_builder.gated(new_records, min_conf)
-            )
-        except Exception as exc:  # the ledger must not sink the briefing
-            logger.error("autopilot_trade_alerts_failed", error=str(exc))
-            briefing.notes.append(f"step trade-alerts FAILED: {exc}")
+        sendable_records = _project_trade_alerts(con, briefing, config, briefing_date)
 
     _deliver(config, briefing)
-
-    if sendable_records:
-        sent = notify.send_trade_alerts(config, sendable_records)
-        try:
-            with database.connection(config.paths.database_path) as con:
-                trade_alerts_builder.mark_delivered(con, sendable_records, delivered=sent)
-        except Exception as exc:  # a failed stamp must not affect the return value
-            logger.error("autopilot_trade_alerts_stamp_failed", error=str(exc))
+    _send_trade_alerts(config, sendable_records)
 
     return briefing
 

@@ -130,10 +130,17 @@ def build_trade_plan(
     atr = wilder_atr(bars, atr_period)
     if atr is None or not math.isfinite(atr) or atr <= 0 or direction == 0:
         return None
-    entry = entry_override if entry_override is not None else (
-        sorted(bars, key=lambda b: b.date)[-1].close
-    )
-    if entry <= 0:
+    # Entry reads the same validity-filtered view of history as the ATR does:
+    # a stored NaN close on the single most-recent bar must not become an
+    # entry that sails through every <= 0 guard (NaN compares false).
+    valid_bars = [b for b in bars if _is_valid_bar(b)]
+    if entry_override is not None:
+        entry = entry_override
+    elif valid_bars:
+        entry = sorted(valid_bars, key=lambda b: b.date)[-1].close
+    else:
+        return None
+    if not math.isfinite(entry) or entry <= 0:
         return None
 
     stop_distance = atr_stop_multiple * atr

@@ -108,6 +108,30 @@ class TestBuildTradePlan:
         assert plan.unsizeable
         assert plan.stop < plan.entry_ref  # the plan geometry still renders
 
+    def test_nan_close_on_latest_bar_never_becomes_the_entry(self):
+        # The freshest bar is exactly the one a halted/no-trade day corrupts.
+        # ATR drops the bar, but entry must not read the unfiltered list and
+        # carry a NaN through every <= 0 guard into a rendered plan.
+        bars = _bars(40, close=100.0, spread=2.0)
+        last = bars[-1]
+        bars[-1] = Bar(
+            date=last.date,
+            open=last.open,
+            high=last.high,
+            low=last.low,
+            close=float("nan"),
+            adj_close=last.adj_close,
+        )
+        plan = build_trade_plan(
+            bars=bars, direction=1, predicted_move=0.03, horizon_days=20,
+            as_of=date(2026, 7, 23), account_equity=10_000.0,
+            risk_pct_per_trade=1.0, atr_period=14, atr_stop_multiple=2.0,
+            max_position_pct=20.0,
+        )
+        assert plan is not None
+        assert math.isfinite(plan.entry_ref)
+        assert plan.entry_ref == pytest.approx(100.0)
+
     def test_insufficient_history_returns_none(self):
         plan = build_trade_plan(
             bars=_bars(5), direction=1, predicted_move=0.02, horizon_days=5,

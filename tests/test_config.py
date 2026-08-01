@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from market_intelligence.config import (
     CompanyEntry,
@@ -12,6 +13,7 @@ from market_intelligence.config import (
     ConfigError,
     FredDefaults,
     GapScannerConfig,
+    PortfolioConfig,
     TradingConfig,
     load_config,
 )
@@ -159,3 +161,57 @@ class TestGapScannerConfig:
         g = GapScannerConfig()
         assert g.min_confidence < 50
         assert g.min_confidence < TradingConfig().min_confidence
+
+
+class TestPortfolioConfigStopsBetaAndLeverage:
+    """Three risk controls added 2026-08-01, all opt-in. Every default here
+    must reproduce the account's prior, unlevered, unstopped, un-beta-managed
+    behaviour -- these tests pin the defaults themselves, not just that they
+    validate."""
+
+    def test_new_controls_default_off(self) -> None:
+        config = PortfolioConfig()
+        assert config.stop_loss_kind == "none"
+        assert config.max_beta is None
+        assert config.target_beta is None
+        assert config.max_gross == 1.0  # unchanged, despite the raised ceiling
+
+    def test_stop_loss_field_defaults(self) -> None:
+        config = PortfolioConfig()
+        assert config.stop_loss_pct == pytest.approx(0.20)
+        assert config.stop_loss_atr_multiple == pytest.approx(8.0)
+        assert config.stop_loss_atr_period == 14
+
+    def test_max_gross_now_accepts_up_to_4x(self) -> None:
+        assert PortfolioConfig(max_gross=4.0).max_gross == pytest.approx(4.0)
+        assert PortfolioConfig(max_gross=2.5).max_gross == pytest.approx(2.5)
+
+    def test_max_gross_still_rejects_above_4x(self) -> None:
+        with pytest.raises(ValidationError):
+            PortfolioConfig(max_gross=4.01)
+
+    def test_max_gross_still_rejects_non_positive(self) -> None:
+        with pytest.raises(ValidationError):
+            PortfolioConfig(max_gross=0.0)
+
+    def test_stop_loss_kind_rejects_an_unknown_literal(self) -> None:
+        with pytest.raises(ValidationError):
+            PortfolioConfig(stop_loss_kind="trailing")  # type: ignore[arg-type]
+
+    def test_max_beta_and_target_beta_are_independently_settable(self) -> None:
+        config = PortfolioConfig(max_beta=1.0, target_beta=0.8)
+        assert config.max_beta == pytest.approx(1.0)
+        assert config.target_beta == pytest.approx(0.8)
+
+    def test_target_beta_above_max_beta_is_rejected(self) -> None:
+        """A target the cap itself forbids would fight the account every day."""
+        with pytest.raises(ValidationError, match="target_beta"):
+            PortfolioConfig(max_beta=0.5, target_beta=1.0)
+
+    def test_target_beta_equal_to_max_beta_is_allowed(self) -> None:
+        config = PortfolioConfig(max_beta=1.0, target_beta=1.0)
+        assert config.target_beta == config.max_beta
+
+    def test_max_beta_alone_or_target_beta_alone_never_raises(self) -> None:
+        PortfolioConfig(max_beta=1.0)
+        PortfolioConfig(target_beta=1.0)

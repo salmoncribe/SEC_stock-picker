@@ -276,6 +276,30 @@ class PortfolioConfig(BaseModel):
     posterior agrees with the hand-rolled closed form to 1.4e-17, so pypfopt is
     the default and "numpy" is a tested substitute rather than a fallback we
     expect to need. pypfopt never sits in the optimizer solve path either way.
+
+    Three risk controls default OFF and change nothing until Michael turns
+    them on -- see ``docs/plans/2026-08-01-portfolio-brain-orchestration.md``
+    §5g-§5j for the measurements behind all three:
+
+    * ``stop_loss_kind`` -- there was no per-position stop of any kind before
+      this: a single name could fall 60% with nothing intervening until the
+      portfolio-level drawdown governor fired at -10%. See
+      ``portfolio.stops`` for the two kinds and why both are measured against
+      average cost basis rather than a per-lot entry (this account has no
+      lot-level history).
+    * ``max_beta`` / ``target_beta`` -- shipped portfolio beta is ~0.37, purely
+      as a side effect of vol targeting and the hedge filter; nothing enforced
+      or targeted it. ``max_beta`` caps it in the optimizer's own solve;
+      ``target_beta`` fills the gap between the strategy's own beta and the
+      target using unused gross capacity in SPY (``FeedBundle.spy_index``) --
+      the "idle cash should hold market exposure, not nothing" base layer
+      that §5j's overlay measurement found genuinely additive (Sharpe 1.04,
+      beating SPY on both CAGR and risk-adjusted return, at 0.6x SPY overlay
+      and zero leverage).
+    * ``max_gross`` -- unblocked from a hard schema ceiling of 1.0 (leverage
+      was previously not just undefaulted but *inexpressible*) to 4.0. Read
+      its own docstring before raising it: past ~2.5x this is a way to lose
+      money, not make it, and that is arithmetic, not a tuning failure.
     """
 
     # -- account ---------------------------------------------------------- #
@@ -287,9 +311,93 @@ class PortfolioConfig(BaseModel):
     # -- risk limits ------------------------------------------------------ #
     max_position: float = Field(default=0.15, gt=0.0, le=1.0)
     max_cluster: float = Field(default=0.30, gt=0.0, le=1.0)
-    max_gross: float = Field(default=1.0, gt=0.0, le=1.0)
+    #: Hard ceiling on gross exposure, read by both the optimizer's own
+    #: ``sum(w) <= max_gross`` constraint and (as of this field's schema
+    #: change) :func:`~market_intelligence.portfolio.risk.vol_target_scale`'s
+    #: ``cap`` -- one number governs both, on purpose, so the two controls
+    #: cannot silently disagree about how much the book may hold.
+    #:
+    #: The bound was 1.0 (``le=1.0``): not merely defaulted unlevered but
+    #: schema-rejected above it, so leverage had never once been measured on
+    #: this strategy before ``docs/plans/2026-08-01-portfolio-brain-orchestration.md``
+    #: §5g. Raised to 4.0 so it is *reachable*; **the default stays 1.0,
+    #: unchanged**. Raising it is a deliberate, informed decision, not a
+    #: default to reach for -- the measurements say so plainly:
+    #:
+    #: Net of 6%/yr financing on the borrowed portion (§5g), raw CAGR rises
+    #: monotonically with the cap but net return peaks near 1.5x and falls
+    #: after -- leverage is worth roughly +2.6 points net, not the +9 points
+    #: the raw number implies.
+    #:
+    #: Worse, and true with *no* financing at all: past a lower point,
+    #: leverage on its own destroys return via volatility drag. Sweeping raw
+    #: leverage 1x-6x on the return-overlay measurement (§5j):
+    #:
+    #: ============  ==========  ==========  ==========
+    #: leverage      CAGR        vol         maxDD
+    #: ============  ==========  ==========  ==========
+    #: 1.0x          22.0%       26.8%       32.7%
+    #: 2.5x          **33.0%**   66.6%       73.8%   (peak)
+    #: 4.0x          23.9%       105.6%      92.4%
+    #: 6.0x          **-13.1%**  151.5%      99.8%   (negative)
+    #: ============  ==========  ==========  ==========
+    #:
+    #: Geometric growth is ``mu - sigma^2 / 2``; past ~2.5x the variance term
+    #: grows faster than the mean and CAGR falls, turning negative by 6x. No
+    #: risk control in this module escapes that -- it is arithmetic, not a
+    #: tuning failure.
+    #:
+    #: One more caveat, verified while wiring this through: the paper account
+    #: (``portfolio.account`` / ``portfolio.costs``) is long-and-cash only by
+    #: explicit design -- ``costs.py`` states plainly that "borrow/financing
+    #: is absent because the account is long-and-cash only" -- and
+    #: ``simulator._settle`` clamps every buy to cash actually on hand. Raising
+    #: this field lets the optimizer *target* gross above 1.0 and lets the
+    #: volatility scaler *scale* above 1.0; it does not give the ledger
+    #: anything to borrow with. A replay run above 1.0x will see buys silently
+    #: under-filled by the cash clamp rather than reaching the configured
+    #: gross, until the account grows an actual margin/borrow mechanism --
+    #: a separate, larger change this field does not make.
+    max_gross: float = Field(default=1.0, gt=0.0, le=4.0)
     target_vol: float = Field(default=0.12, gt=0.0)
     max_single_name_risk_share: float = Field(default=0.35, gt=0.0, le=1.0)
+
+    # -- per-position stop loss (opt-in; "none" preserves current behaviour) #
+    # See ``portfolio.stops`` for the two kinds' exact geometry. Both are
+    # evaluated once per day, independent of the rebalance cadence, so a name
+    # can be stopped out between scheduled rebalances rather than waiting up
+    # to ``rebalance_days`` sessions for the portfolio-level drawdown governor
+    # to notice at -10% account-wide.
+    stop_loss_kind: Literal["none", "fixed_pct", "atr_multiple"] = "none"
+    #: Exit once the mark has fallen this fraction below the position's
+    #: average cost basis. Only read when ``stop_loss_kind == "fixed_pct"``.
+    stop_loss_pct: float = Field(default=0.20, gt=0.0, lt=1.0)
+    #: Exit once the mark has fallen ``stop_loss_atr_multiple`` Wilder ATRs
+    #: below average cost basis. 8.0 matches this codebase's own validated
+    #: "disaster brake" geometry (a wide stop that is risk control, not a
+    #: profit target -- see ``analytics.backtest``'s ``EXIT_HORIZON`` and the
+    #: class docstring's geometry note), not the tighter 2.0 the live alert
+    #: path ships for a trade meant to be managed actively.
+    stop_loss_atr_multiple: float = Field(default=8.0, gt=0.0)
+    #: Wilder smoothing period for the stop's own ATR. Matches
+    #: ``TradingConfig.atr_period``'s default so "14-day ATR" means the same
+    #: thing everywhere in this codebase.
+    stop_loss_atr_period: int = Field(default=14, ge=2)
+
+    # -- beta (opt-in; None preserves current behaviour on both) ----------- #
+    #: Cap on the book's beta-weighted exposure (`sum(beta_i * w_i)`),
+    #: enforced inside the optimizer's own solve -- see
+    #: ``optimizer.solve_max_sharpe`` / ``solve_min_cvar``'s ``beta`` /
+    #: ``max_beta`` arguments. ``None`` (default) applies no constraint,
+    #: reproducing today's behaviour, where beta is ~0.37 purely as a
+    #: byproduct of vol targeting and the hedge filter.
+    max_beta: float | None = Field(default=None, gt=0.0)
+    #: When the book's own predicted beta sits below this, the shortfall is
+    #: filled with SPY, bounded by whatever gross capacity is not already
+    #: spoken for (never by borrowing beyond ``max_gross``, and deliberately
+    #: not by ``max_position`` -- see ``simulator._apply_target_beta``).
+    #: ``None`` (default) applies no fill, reproducing today's behaviour.
+    target_beta: float | None = Field(default=None, ge=0.0)
 
     # -- drawdown governor (Michael's moderate risk budget) --------------- #
     # Halve gross at -10%, flatten at -15%. ``governor_bypasses_band`` is a
@@ -372,6 +480,20 @@ class PortfolioConfig(BaseModel):
             raise ValueError(
                 "max_cluster must be >= max_position "
                 f"(got cluster={self.max_cluster}, position={self.max_position})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_beta_ladder(self) -> PortfolioConfig:
+        """A beta target above the beta cap would fight itself every day."""
+        if (
+            self.max_beta is not None
+            and self.target_beta is not None
+            and self.target_beta > self.max_beta
+        ):
+            raise ValueError(
+                "target_beta must be <= max_beta when both are set "
+                f"(got target={self.target_beta}, cap={self.max_beta})"
             )
         return self
 

@@ -7,7 +7,7 @@ account of record.
 
 Layering, strictly downward -- no module imports one below it:
 
-    account   costs   metrics          (pure, no internal deps)
+    account   costs   metrics   stops   (pure, no internal deps)
     feed                               (the one bounded DB read)
     risk                               (numpy; account, for the HWM decay)
     views                              (risk)

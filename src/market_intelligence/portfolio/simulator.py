@@ -101,6 +101,7 @@ from market_intelligence.portfolio.risk import (
     targeting_cov,
     vol_target_scale,
 )
+from market_intelligence.portfolio.stops import average_cost, evaluate_stop, trailing_atr
 from market_intelligence.portfolio.views import View, bl_posterior, views_from_signals
 
 _log = get_logger("portfolio.simulator")
@@ -140,6 +141,23 @@ _CRASH_WINDOW_SESSIONS = 50
 #: A doubled -60% day is -120%, which is not a price. Returns are floored here
 #: before a synthetic path is compounded, so a stressed panel stays positive.
 _MIN_STRESSED_RETURN = -0.99
+
+#: Bars of history read for the stop's ATR, ending strictly before the
+#: decision day. Mirrors ``signals.trade_alerts.build_records``' own
+#: ``atr_period * 4`` buffer (``limit = trading.atr_period * 4``) so a
+#: handful of missing sessions inside the window does not starve the
+#: estimate -- ``stops.trailing_atr`` (via ``wilder_atr``) only needs
+#: ``period + 1`` of them to be valid.
+_ATR_LOOKBACK_MULTIPLE = 4
+
+#: ``vol_target_scale`` raises on a non-positive ``cap`` (see its docstring:
+#: a scale has to scale *something*). ``config.max_gross * governor_scale``
+#: reaches exactly 0.0 on a flatten event (``governor_scale == 0.0``) with
+#: live views still present -- a real, historically-exercised path (the
+#: COVID flatten). This floor keeps that call from raising; the weights being
+#: scaled are already ~0 under the matching ``max_gross=0`` optimizer
+#: constraint, so what the floor multiplies by cannot matter in practice.
+_MIN_LEVERAGE_CAP = 1e-9
 
 
 @dataclass(frozen=True)
@@ -350,17 +368,33 @@ def execute_day(
     equity_ref = float(mark(state, prior_prices, stale_ok=True).equity)
 
     delisted = tuple(symbol for symbol in held if _is_delisted(panel, row, symbol))
+    # Independent of the rebalance cadence below -- a stop must not have to
+    # wait up to ``rebalance_days`` sessions for the next scheduled rebalance.
+    stopped = _stopped_positions(panel, row, state, prior_prices, delisted, config)
 
     views: tuple[View, ...] = ()
     if decision_day is not None:
         views = _live_views(bundle, config, as_of=as_of, decision_day=decision_day)
 
     known = set(panel.symbols)
-    universe = tuple(
-        sorted(({view.symbol for view in views} | set(held)) - set(delisted) & known)
+    # SPY is force-included whenever ``target_beta`` mode is on, held or not,
+    # viewed or not: it has to be sizeable *before* it is ever held, and its
+    # weight stays 0 on any day the top-up below adds nothing, so this has no
+    # effect unless the mode is actually on.
+    spy_symbol = (
+        panel.symbols[bundle.spy_index]
+        if config.target_beta is not None and bundle.spy_index is not None
+        else None
     )
+    base_universe = ({view.symbol for view in views} | set(held)) - set(delisted)
+    if spy_symbol is not None:
+        base_universe = base_universe | {spy_symbol}
+    universe = tuple(sorted(base_universe & known))
     views = tuple(view for view in views if view.symbol in universe)
-    invested = tuple(sorted({view.symbol for view in views}))
+    # A stopped name is excluded the same way an expired view already is: the
+    # absence of a reason to hold is the exit, and a stop that gets re-bought
+    # by the same rebalance it fired in is not a stop.
+    invested = tuple(sorted({view.symbol for view in views} - set(stopped)))
 
     w_current = _current_weights(state, universe, prior_prices, equity_ref)
     w_target = w_current.copy()
@@ -402,6 +436,14 @@ def execute_day(
                 tau=config.tau,
                 risk_aversion=config.risk_aversion,
             )
+            beta_vector = (
+                np.array(
+                    [_beta_of(bundle.betas, symbol, spy_symbol) for symbol in invested],
+                    dtype=np.float64,
+                )
+                if config.max_beta is not None
+                else None
+            )
             result = optimize(
                 posterior.mu,
                 _optimizer_covariance(horizon_sigma, counts),
@@ -416,6 +458,8 @@ def execute_day(
                 clusters=clusters,
                 scenario_returns=block,
                 alpha=config.cvar_alpha,
+                beta=beta_vector,
+                max_beta=config.max_beta,
             )
             # The scaler reads its own fast covariance, not ``sigma``. Same
             # weights, same window, different estimator: the optimizer above
@@ -430,12 +474,50 @@ def execute_day(
                 targeting_cov(block, lam=config.vol_estimate_lambda),
                 target_vol=config.target_vol,
                 periods_per_year=_PERIODS_PER_YEAR,
+                # Config-driven, not the old hardcoded 1.0 -- see
+                # ``PortfolioConfig.max_gross``. Floored so a flatten event
+                # (``governor_scale == 0.0``) cannot make this raise; the
+                # weights it would be scaling are already ~0 under the
+                # matching ``max_gross=0`` optimizer constraint above.
+                cap=max(config.max_gross * governor_scale, _MIN_LEVERAGE_CAP),
             )
             optimizer_status = result.status
             reasons = result.trade_reasons
             w_target = np.zeros(len(universe), dtype=np.float64)
             for column, symbol in enumerate(invested):
                 w_target[universe.index(symbol)] = float(result.weights[column]) * vol_scale
+
+            # ``result.weights`` is already gross-capped by the optimizer's
+            # own ``max_gross`` constraint above; now that ``vol_scale`` can
+            # exceed 1.0 (see the ``cap`` comment above it), the two compose
+            # MULTIPLICATIVELY rather than as one shared ceiling. Measured
+            # directly: an unconstrained-by-position-caps solve already using
+            # its full 2.0x allowance, scaled by a vol_scale of ~1.82 (itself
+            # under its own 2.0x cap), reached 3.65x realized gross -- 1.8x
+            # over the configured ceiling. This is a hard backstop, not a
+            # second opinion: whatever the two controls did upstream, target
+            # gross never leaves this line above ``max_gross * governor_scale``.
+            # A no-op whenever ``vol_scale <= 1.0`` (the case for every
+            # existing, unlevered ``max_gross=1.0`` config, since the
+            # optimizer's own solve is already <= that same ceiling and a
+            # scale <= 1 cannot push it back over).
+            target_gross = float(w_target.sum())
+            gross_ceiling = config.max_gross * governor_scale
+            if target_gross > gross_ceiling > 0.0:
+                w_target = w_target * (gross_ceiling / target_gross)
+
+    if rebalanced and not de_risking and config.target_beta is not None:
+        # Never during de-risking: the governor's whole job is cutting
+        # exposure in a drawdown, and topping up SPY at that exact moment
+        # would fight the circuit breaker it is trying to be.
+        w_target = _apply_target_beta(
+            w_target,
+            universe,
+            bundle.betas,
+            spy_symbol,
+            target_beta=config.target_beta,
+            max_gross=config.max_gross * governor_scale,
+        )
 
     if rebalanced:
         w_target = apply_no_trade_band(
@@ -444,6 +526,11 @@ def execute_day(
             band=config.no_trade_band,
             bypass=de_risking and bool(config.governor_bypasses_band),
         )
+
+    if stopped:
+        w_target = _apply_stop_exits(w_target, universe, stopped)
+        stop_reason = f"stop_loss ({config.stop_loss_kind})"
+        reasons = {**reasons, **dict.fromkeys(stopped, stop_reason)}
 
     trades = _planned_trades(
         panel,
@@ -649,6 +736,172 @@ def _optimizer_covariance(sigma: np.ndarray, counts: np.ndarray) -> np.ndarray:
     diagonal = np.diag(out).copy()
     diagonal[unusable] = np.nan
     np.fill_diagonal(out, diagonal)
+    return out
+
+
+def _trailing_atr_raw(panel: MarketPanel, row: int, symbol: str, period: int) -> float | None:
+    """The stop's ATR, ending strictly before ``row``, rescaled to raw space.
+
+    ``stops.trailing_atr`` reads adjusted OHLC (``signals.trade_plan``'s own
+    convention, and what the panel stores in ``open``/``high``/``low``); the
+    stop compares it against ``reference_price``, which is a raw close
+    (``_mark_prices`` / ``prior_prices``) matched against ``cost_basis`` (also
+    raw -- fills execute at ``raw_open``). Rescaling by row ``row - 1``'s own
+    ``raw_close / close`` factor is exactly the de-adjustment ``_raw_open``
+    already applies to the panel's open; using the *same* row for both the ATR
+    rescale and the reference price keeps them on one scale.
+    """
+    column = panel.column_of(symbol)
+    end = min(row, panel.calendar.size)
+    start = max(0, end - period * _ATR_LOOKBACK_MULTIPLE)
+    if end - start < period + 1:
+        return None
+    atr_adjusted = trailing_atr(
+        panel.high[start:end, column], panel.low[start:end, column], panel.close[start:end, column],
+        period=period,
+    )
+    if atr_adjusted is None:
+        return None
+    last = end - 1
+    adjusted_close = float(panel.close[last, column])
+    raw_close = float(panel.raw_close[last, column])
+    if not math.isfinite(adjusted_close) or adjusted_close <= 0.0:
+        return None
+    if not math.isfinite(raw_close) or raw_close <= 0.0:
+        return None
+    return atr_adjusted * raw_close / adjusted_close
+
+
+def _stopped_positions(
+    panel: MarketPanel,
+    row: int,
+    state: AccountState,
+    prior_prices: Mapping[str, float],
+    delisted: tuple[str, ...],
+    config: PortfolioConfig,
+) -> tuple[str, ...]:
+    """Held, non-delisted symbols whose stop (``portfolio.stops``) fired.
+
+    Evaluated against ``prior_prices`` -- day ``row - 1``'s raw close, the
+    same decision-time price ``w_current`` / ``equity_ref`` already read -- so
+    a stop detected today executes into an exit at *today's* open, exactly
+    like every other decision this module makes on yesterday's information.
+    Runs every day regardless of ``rebalance_days``: the whole point is not to
+    make a stopped name wait for the next scheduled rebalance.
+    """
+    if config.stop_loss_kind == "none":
+        return ()
+    excluded = set(delisted)
+    triggered: list[str] = []
+    for symbol in sorted(state.positions):
+        if symbol in excluded:
+            continue
+        reference = prior_prices.get(symbol)
+        if reference is None:
+            continue
+        position = state.positions[symbol]
+        entry = average_cost(position.cost_basis, position.shares)
+        atr = (
+            _trailing_atr_raw(panel, row, symbol, config.stop_loss_atr_period)
+            if config.stop_loss_kind == "atr_multiple"
+            else None
+        )
+        check = evaluate_stop(
+            symbol=symbol,
+            kind=config.stop_loss_kind,
+            entry_price=entry,
+            reference_price=reference,
+            atr=atr,
+            stop_pct=config.stop_loss_pct,
+            atr_multiple=config.stop_loss_atr_multiple,
+        )
+        if check.triggered:
+            triggered.append(symbol)
+    return tuple(triggered)
+
+
+def _apply_stop_exits(
+    w_target: np.ndarray, universe: tuple[str, ...], stopped: tuple[str, ...]
+) -> np.ndarray:
+    """Force every stopped symbol's target to zero -- a full exit.
+
+    Applied after the no-trade band so it can never be suppressed as ordinary
+    rebalance noise -- the same reasoning ``apply_no_trade_band`` already
+    applies to a full exit ("a full exit is never banded") and the governor's
+    own de-risking bypass, extended to a third reason a position must leave
+    regardless of how small the resulting weight change looks.
+    """
+    out = w_target.copy()
+    for symbol in stopped:
+        if symbol in universe:
+            out[universe.index(symbol)] = 0.0
+    return out
+
+
+def _beta_of(betas: Mapping[str, float], symbol: str, spy_symbol: str | None) -> float:
+    """A symbol's beta for ``max_beta`` / ``target_beta``, fail-closed.
+
+    SPY is beta 1 to itself by definition -- it is the market index this
+    control hedges and targets against, so it never needs a lookup. Every
+    other name defaults to 1.0, not 0.0, when ``betas`` has no entry for it
+    (``FeedBundle.betas`` can come back completely empty; see ``feed.py``'s
+    ``load_betas``). Zero would read as "this name needs no hedge," which is
+    the wrong direction to be wrong in for both consumers here: it would let
+    an unmeasured name quietly loosen ``max_beta`` beyond what it should
+    allow, and it would make ``target_beta`` add more SPY than the book
+    already needs. 1.0 -- assume full market exposure until proven otherwise
+    -- is conservative in the same direction for both, and degrades sensibly
+    at the limit: if every name in ``betas`` is unmeasured, ``max_beta``
+    collapses to another gross cap and ``target_beta`` collapses to "top cash
+    up to max_gross," rather than either control silently doing nothing.
+    """
+    if spy_symbol is not None and symbol == spy_symbol:
+        return 1.0
+    value = betas.get(symbol)
+    return float(value) if value is not None and math.isfinite(value) else 1.0
+
+
+def _apply_target_beta(
+    w_target: np.ndarray,
+    universe: tuple[str, ...],
+    betas: Mapping[str, float],
+    spy_symbol: str | None,
+    *,
+    target_beta: float,
+    max_gross: float,
+) -> np.ndarray:
+    """Top up SPY until the book's predicted beta reaches ``target_beta``.
+
+    Spends only unused gross capacity (``max_gross - sum(w_target)``, already
+    scaled by the governor at the call site) -- the "idle cash should hold
+    market exposure instead of nothing" base layer. Never funded by trimming
+    another position and never by borrowing beyond ``max_gross``.
+
+    Bounded by ``max_gross``, deliberately **not** by ``max_position``: SPY
+    here stands in for idle cash as diversified index exposure, not a
+    concentrated single-name bet, and the per-name cap that exists to bound
+    idiosyncratic company risk would make most ``target_beta`` values
+    structurally unreachable at the default 15% position cap (§5i's own
+    "beta -> 1.7 gives ~30%/yr" scenario needs SPY weight far past 15%). A
+    deliberate exception, not an oversight -- see
+    ``PortfolioConfig.target_beta``.
+    """
+    if spy_symbol is None or spy_symbol not in universe:
+        return w_target
+    spy_column = universe.index(spy_symbol)
+    predicted_beta = float(
+        sum(
+            w_target[index] * _beta_of(betas, symbol, spy_symbol)
+            for index, symbol in enumerate(universe)
+        )
+    )
+    shortfall = max(0.0, target_beta - predicted_beta)
+    headroom = max(0.0, max_gross - float(w_target.sum()))
+    addition = min(shortfall, headroom)
+    if addition <= 0.0:
+        return w_target
+    out = w_target.copy()
+    out[spy_column] += addition
     return out
 
 

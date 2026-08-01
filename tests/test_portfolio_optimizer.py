@@ -360,3 +360,148 @@ def test_optimize_reports_the_path_that_produced_the_answer(
     missing = optimize(mu, sigma, w_current, symbols, objective="min_cvar")
     assert missing.status == "fallback_inverse_vol"
     assert np.isfinite(missing.weights).all()
+
+
+# --------------------------------------------------------------------------- #
+# max_beta -- enforced in-solve, and again as a fallback/tolerance backstop     #
+# --------------------------------------------------------------------------- #
+def test_max_beta_binds_inside_solve_max_sharpe() -> None:
+    mu = np.full(4, 0.30)
+    sigma = _sigma(np.full(4, 0.20))
+    beta = np.full(4, 2.0)
+    kwargs = {
+        "risk_aversion": 2.5,
+        "turnover_penalty": 0.0,
+        "max_gross": 1.0,
+        "max_position": 1.0,
+    }
+
+    unconstrained, status, _ = solve_max_sharpe(mu, sigma, np.zeros(4), **kwargs)
+    assert status == "clarabel"
+    assert unconstrained is not None
+    assert float(unconstrained.sum()) > 0.5  # meaningfully invested absent a beta cap
+
+    capped, status2, _ = solve_max_sharpe(mu, sigma, np.zeros(4), beta=beta, max_beta=0.6, **kwargs)
+    assert status2 in ("clarabel", "scs")
+    assert capped is not None
+    assert float(beta @ capped) <= 0.6 + 1e-6
+    assert float(capped.sum()) < float(unconstrained.sum())
+
+
+def test_max_beta_binds_inside_solve_min_cvar() -> None:
+    rng = np.random.default_rng(7)
+    scenarios = 0.10 + 0.02 * rng.standard_normal((500, 4))
+    beta = np.full(4, 2.0)
+    kwargs = {"alpha": 0.95, "turnover_penalty": 0.0, "max_gross": 1.0, "max_position": 1.0}
+
+    unconstrained, status, _ = solve_min_cvar(scenarios, np.zeros(4), **kwargs)
+    assert status == "clarabel"
+    assert unconstrained is not None
+    assert float(unconstrained.sum()) > 0.5
+
+    capped, status2, _ = solve_min_cvar(scenarios, np.zeros(4), beta=beta, max_beta=0.6, **kwargs)
+    assert status2 in ("clarabel", "scs")
+    assert capped is not None
+    assert float(beta @ capped) <= 0.6 + 1e-6
+    assert float(capped.sum()) < float(unconstrained.sum())
+
+
+def test_optimize_threads_the_beta_cap_through_to_either_objective() -> None:
+    mu = np.full(2, 0.30)
+    sigma = _sigma(np.full(2, 0.20))
+    beta = np.full(2, 2.0)
+    symbols = ("AAA", "BBB")
+
+    max_sharpe_result = optimize(
+        mu, sigma, np.zeros(2), symbols, max_gross=1.0, max_position=1.0, beta=beta, max_beta=0.6
+    )
+    assert max_sharpe_result.status in ("clarabel", "scs")
+    assert float(beta @ max_sharpe_result.weights) <= 0.6 + 1e-6
+
+    rng = np.random.default_rng(11)
+    scenarios = 0.10 + 0.02 * rng.standard_normal((300, 2))
+    cvar_result = optimize(
+        mu,
+        sigma,
+        np.zeros(2),
+        symbols,
+        objective="min_cvar",
+        max_gross=1.0,
+        max_position=1.0,
+        scenario_returns=scenarios,
+        beta=beta,
+        max_beta=0.6,
+    )
+    assert cvar_result.status in ("clarabel", "scs")
+    assert float(beta @ cvar_result.weights) <= 0.6 + 1e-6
+
+
+def test_fallback_weights_respect_the_beta_cap_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A degraded day (solver failure) must not be the day the beta cap is silently off."""
+    mu = np.full(2, 0.30)
+    sigma = _sigma(np.full(2, 0.20))
+    beta = np.full(2, 2.0)
+
+    monkeypatch.setattr(
+        opt, "solve_max_sharpe", lambda *a, **k: (None, "no_solver_converged", None)
+    )
+    result = optimize(
+        mu,
+        sigma,
+        np.zeros(2),
+        ("AAA", "BBB"),
+        max_gross=1.0,
+        max_position=1.0,
+        beta=beta,
+        max_beta=0.6,
+    )
+    assert result.status == "fallback_inverse_vol"
+    # inverse-vol alone would put both names at gross 1.0 (beta 2.0, over cap);
+    # the fallback's own projection has to be the thing that pulls it back in.
+    assert float(beta @ result.weights) <= 0.6 + 1e-6
+    assert result.weights.sum() > 0.0  # not just zeroed outright
+
+
+def test_omitting_beta_reproduces_prior_behaviour_exactly() -> None:
+    mu = np.array([0.20, 0.10, -0.05])
+    sigma = _sigma(np.array([0.20, 0.15, 0.30]), correlation=0.1)
+    symbols = ("AAA", "BBB", "CCC")
+
+    implicit = optimize(mu, sigma, np.zeros(3), symbols)
+    explicit_none = optimize(mu, sigma, np.zeros(3), symbols, beta=None, max_beta=None)
+    assert np.array_equal(implicit.weights, explicit_none.weights)
+    assert implicit.status == explicit_none.status
+
+
+# --------------------------------------------------------------------------- #
+# _project's beta clamp in isolation                                          #
+# --------------------------------------------------------------------------- #
+def test_project_beta_clamp_scales_uniformly_to_the_cap() -> None:
+    weights = np.array([0.5, 0.5])
+    upper = np.array([1.0, 1.0])
+    beta = np.array([2.0, 2.0])
+    projected = opt._project(
+        weights, upper=upper, max_gross=1.0, groups=(), max_cluster=1.0, beta=beta, max_beta=0.6
+    )
+    assert float(beta @ projected) == pytest.approx(0.6, abs=1e-9)
+    assert projected[0] == pytest.approx(projected[1])
+
+
+def test_project_beta_clamp_is_a_noop_when_already_within_cap() -> None:
+    weights = np.array([0.1, 0.1])
+    upper = np.array([1.0, 1.0])
+    beta = np.array([2.0, 2.0])
+    projected = opt._project(
+        weights, upper=upper, max_gross=1.0, groups=(), max_cluster=1.0, beta=beta, max_beta=0.6
+    )
+    assert np.array_equal(projected, np.array([0.1, 0.1]))
+
+
+def test_project_beta_clamp_handles_a_non_positive_cap_without_raising() -> None:
+    weights = np.array([0.5, 0.5])
+    upper = np.array([1.0, 1.0])
+    beta = np.array([2.0, 2.0])
+    projected = opt._project(
+        weights, upper=upper, max_gross=1.0, groups=(), max_cluster=1.0, beta=beta, max_beta=0.0
+    )
+    assert np.allclose(projected, 0.0)

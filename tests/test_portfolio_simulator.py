@@ -1274,3 +1274,318 @@ def test_the_band_and_the_turnover_penalty_each_cut_trading_on_their_own() -> No
     assert len(priced.fills) < len(loose.fills)
     assert _annual_turnover(banded) < _annual_turnover(loose)
     assert _annual_turnover(priced) < _annual_turnover(loose)
+
+
+# --------------------------------------------------------------------------- #
+# 15. per-position stop losses (2026-08-01)                                    #
+# --------------------------------------------------------------------------- #
+def test_stop_loss_fires_between_rebalances_and_fills_at_the_next_open() -> None:
+    """A single name can no longer fall through to the next scheduled rebalance.
+
+    ``rebalance_days=4`` and ``row=5`` (5 % 4 != 0) is deliberately a
+    non-scheduled day with no live view and no de-risking, so under the old
+    code this day would be a pure ride (see
+    ``test_days_with_no_live_view_hold_rather_than_liquidate``). The stop must
+    still fire, and it must fire on yesterday's close reaching today's open --
+    the same t+1 discipline as every other decision in this module.
+    """
+    days = _sessions(8)
+    symbols = ("AAA",)
+    closes = np.column_stack([np.concatenate([np.full(4, 100.0), np.full(4, 70.0)])])
+    bundle = _bundle(symbols, days, closes, [])  # no signals at all
+    config = _config(rebalance_days=4, stop_loss_kind="fixed_pct", stop_loss_pct=0.20)
+    costs = _costs(config)
+
+    held = {"AAA": Position(symbol="AAA", shares=100.0, cost_basis=10_000.0)}  # avg cost $100
+    state = AccountState(as_of=days[4], cash=0.0, positions=held, high_water_mark=10_000.0)
+    history = np.full(5, 10_000.0)
+
+    decision, after = step_day(
+        state, bundle, config, as_of=days[5], equity_history=history, costs=costs
+    )
+
+    assert decision.rebalanced is False, "the stop must not need a rebalance to fire"
+    sells = [o for o in decision.orders if o.side is Side.SELL]
+    assert len(sells) == 1
+    assert sells[0].symbol == "AAA"
+    assert sells[0].reason.startswith("stop_loss")
+    assert sells[0].shares == pytest.approx(100.0)
+
+    day5_open = float(closes[4, 0])  # day 5's open == day 4's close, by panel construction
+    assert day5_open == 70.0
+    assert "AAA" not in after.positions
+    assert after.cash == pytest.approx(
+        100.0 * fill_price(day5_open, is_buy=False, model=costs), abs=1e-9
+    )
+
+
+def test_stop_loss_does_not_fire_a_day_early() -> None:
+    """The control half of the canary above: the day the price is still $100,
+    nothing happens -- proving the prior test's sell is dated by the drop, not
+    by some unconditional day-5 behaviour."""
+    days = _sessions(8)
+    symbols = ("AAA",)
+    closes = np.column_stack([np.concatenate([np.full(4, 100.0), np.full(4, 70.0)])])
+    bundle = _bundle(symbols, days, closes, [])
+    config = _config(rebalance_days=4, stop_loss_kind="fixed_pct", stop_loss_pct=0.20)
+    costs = _costs(config)
+
+    held = {"AAA": Position(symbol="AAA", shares=100.0, cost_basis=10_000.0)}
+    state = AccountState(as_of=days[3], cash=0.0, positions=held, high_water_mark=10_000.0)
+    history = np.full(4, 10_000.0)
+
+    decision, after = step_day(
+        state, bundle, config, as_of=days[4], equity_history=history, costs=costs
+    )
+
+    assert decision.orders == ()
+    assert after.positions["AAA"].shares == pytest.approx(100.0)
+
+
+def test_stop_loss_excludes_the_symbol_from_the_same_day_optimizer_solve() -> None:
+    """A stopped name must not be re-bought by the very rebalance it fired in.
+
+    Paired control/treatment on an identical starting state: the control
+    (stop disabled) proves the live bullish view really would keep or grow
+    the position -- the stop in the treatment is winning against a real pull,
+    not against a no-op.
+    """
+    days = _sessions(8)
+    symbols = ("AAA",)
+    closes = np.column_stack([np.concatenate([np.full(4, 100.0), np.full(4, 70.0)])])
+    signal = _signal("AAA", days[4])  # bullish, live as of day 5
+    bundle = _bundle(symbols, days, closes, [signal])
+    shared = {"rebalance_days": 1, "no_trade_band": 0.0}
+
+    held = {"AAA": Position(symbol="AAA", shares=100.0, cost_basis=10_000.0)}
+    state = AccountState(as_of=days[4], cash=0.0, positions=held, high_water_mark=10_000.0)
+    history = np.full(5, 10_000.0)
+
+    control_config = _config(stop_loss_kind="none", **shared)
+    control_decision, control_after = step_day(
+        state, bundle, control_config, as_of=days[5], equity_history=history,
+        costs=_costs(control_config),
+    )
+    assert control_decision.rebalanced is True
+    assert "AAA" in control_after.positions
+    assert control_after.positions["AAA"].shares > 0.0, "the control needs a real pull to beat"
+
+    stop_config = _config(stop_loss_kind="fixed_pct", stop_loss_pct=0.20, **shared)
+    stop_decision, stop_after = step_day(
+        state, bundle, stop_config, as_of=days[5], equity_history=history,
+        costs=_costs(stop_config),
+    )
+    assert stop_decision.rebalanced is True
+    assert any(o.symbol == "AAA" and o.side is Side.SELL for o in stop_decision.orders)
+    assert all(o.symbol != "AAA" or o.side is not Side.BUY for o in stop_decision.orders)
+    assert "AAA" not in stop_after.positions
+
+
+def test_atr_multiple_stop_wires_through_to_a_real_crash_and_not_a_calm_dip() -> None:
+    """Integration-level only: the exact Wilder recursion is pinned in
+    ``tests/test_portfolio_stops.py``. Here the ATR the wiring will actually
+    use is computed once as an oracle (via the same private helper the
+    simulator calls), and a "tight" and a "loose" multiple are derived from
+    it so the test does not depend on guessing a plausible ATR magnitude.
+    """
+    days = _sessions(30)
+    symbols = ("AAA",)
+    calm = 100.0 + 0.5 * np.sin(np.arange(20))
+    crash = np.full(10, 60.0)
+    closes = np.column_stack([np.concatenate([calm, crash])])
+    bundle = _bundle(symbols, days, closes, [])
+    period = 14
+
+    held = {"AAA": Position(symbol="AAA", shares=100.0, cost_basis=10_000.0)}
+    state = AccountState(as_of=days[20], cash=0.0, positions=held, high_water_mark=10_000.0)
+    history = np.full(21, 10_000.0)
+
+    computed_atr = simulator._trailing_atr_raw(bundle.panel, 21, "AAA", period)
+    assert computed_atr is not None and computed_atr > 0.0
+    assert computed_atr < 40.0, "the oracle must not already exceed the whole crash gap"
+
+    tight_config = _config(
+        rebalance_days=30, stop_loss_kind="atr_multiple",
+        stop_loss_atr_multiple=1.0, stop_loss_atr_period=period,
+    )
+    _, tight_after = step_day(
+        state, bundle, tight_config, as_of=days[21], equity_history=history,
+        costs=_costs(tight_config),
+    )
+    assert "AAA" not in tight_after.positions
+
+    # A multiple calibrated so entry(100) - multiple*atr lands at exactly 55 --
+    # comfortably below the crash close of 60, so this stop must NOT fire.
+    loose_multiple = (100.0 - 55.0) / computed_atr
+    loose_config = _config(
+        rebalance_days=30, stop_loss_kind="atr_multiple",
+        stop_loss_atr_multiple=loose_multiple, stop_loss_atr_period=period,
+    )
+    _, loose_after = step_day(
+        state, bundle, loose_config, as_of=days[21], equity_history=history,
+        costs=_costs(loose_config),
+    )
+    assert "AAA" in loose_after.positions
+
+
+def test_stop_loss_kind_none_reproduces_prior_behaviour_exactly() -> None:
+    """The default: a name can still fall 60% and nothing but the governor acts."""
+    days = _sessions(8)
+    symbols = ("AAA",)
+    closes = np.column_stack([np.concatenate([np.full(4, 100.0), np.full(4, 40.0)])])  # -60%
+    bundle = _bundle(symbols, days, closes, [])
+    config = _config(rebalance_days=4)  # stop_loss_kind defaults to "none"
+    costs = _costs(config)
+
+    held = {"AAA": Position(symbol="AAA", shares=100.0, cost_basis=10_000.0)}
+    state = AccountState(as_of=days[4], cash=0.0, positions=held, high_water_mark=10_000.0)
+    history = np.full(5, 10_000.0)
+
+    decision, after = step_day(
+        state, bundle, config, as_of=days[5], equity_history=history, costs=costs
+    )
+
+    assert decision.orders == ()
+    assert after.positions["AAA"].shares == pytest.approx(100.0)
+
+
+# --------------------------------------------------------------------------- #
+# 16. beta cap and beta targeting (2026-08-01)                                 #
+# --------------------------------------------------------------------------- #
+def test_target_beta_tops_up_spy_with_idle_gross_capacity() -> None:
+    """Idle cash becomes SPY exposure instead of sitting doing nothing."""
+    days = _sessions(5)
+    symbols = ("SPY",)
+    closes = np.column_stack([np.full(5, 400.0)])
+    bundle = _bundle(symbols, days, closes, [])
+    bundle = replace(bundle, spy_index=0, betas={})
+
+    config = _config(rebalance_days=10, target_beta=0.5, max_gross=1.0)
+    costs = _costs(config)
+    state = genesis(config.starting_cash, days[2])
+    history = np.full(3, config.starting_cash)
+
+    decision, after = step_day(
+        state, bundle, config, as_of=days[3], equity_history=history, costs=costs,
+        force_rebalance=True,
+    )
+
+    assert decision.rebalanced is True
+    assert "SPY" in after.positions
+    day3_open = float(closes[2, 0])
+    expected_shares = (0.5 * config.starting_cash) / day3_open
+    assert after.positions["SPY"].shares == pytest.approx(expected_shares, rel=1e-2)
+
+
+def test_target_beta_top_up_is_skipped_while_the_governor_is_de_risking() -> None:
+    """Topping up market exposure mid-drawdown would fight the circuit breaker."""
+    days = _sessions(5)
+    symbols = ("SPY",)
+    closes = np.column_stack([np.full(5, 400.0)])
+    bundle = _bundle(symbols, days, closes, [])
+    bundle = replace(bundle, spy_index=0, betas={})
+
+    config = _config(rebalance_days=10, target_beta=0.5, max_gross=1.0)
+    costs = _costs(config)
+    # A drawdown already past the flatten threshold.
+    state = AccountState(as_of=days[2], cash=10_000.0, positions={}, high_water_mark=20_000.0)
+    history = np.full(3, 10_000.0)
+
+    decision, after = step_day(
+        state, bundle, config, as_of=days[3], equity_history=history, costs=costs,
+        force_rebalance=True,
+    )
+
+    assert decision.governor_scale == 0.0, "the fixture must actually be de-risking"
+    assert "SPY" not in after.positions
+
+
+def test_target_beta_none_reproduces_prior_behaviour_exactly() -> None:
+    """Default off: idle cash stays idle, exactly as before this feature."""
+    days = _sessions(5)
+    symbols = ("SPY",)
+    closes = np.column_stack([np.full(5, 400.0)])
+    bundle = _bundle(symbols, days, closes, [])
+    bundle = replace(bundle, spy_index=0, betas={})
+
+    config = _config(rebalance_days=10, max_gross=1.0)  # target_beta defaults to None
+    costs = _costs(config)
+    state = genesis(config.starting_cash, days[2])
+    history = np.full(3, config.starting_cash)
+
+    decision, after = step_day(
+        state, bundle, config, as_of=days[3], equity_history=history, costs=costs,
+        force_rebalance=True,
+    )
+
+    # With the feature off, SPY is never force-included into the universe at
+    # all -- there is nothing held, no view, and nothing to rebalance, so
+    # ``rebalanced`` correctly stays False rather than acting on an empty book.
+    assert decision.rebalanced is False
+    assert after.positions == {}
+    assert after.cash == pytest.approx(config.starting_cash)
+
+
+# --------------------------------------------------------------------------- #
+# 17. leverage unblocked -- and a compounding defect it exposed (2026-08-01)   #
+# --------------------------------------------------------------------------- #
+def test_raising_max_gross_lets_the_scaler_actually_lever_up() -> None:
+    """``_CALM_ROW`` (test 12's own fixture) predicts volatility a small
+    fraction of the 12% target, so under the old hardcoded ``cap=1.0`` the
+    scaler was held at the ceiling rather than at its own answer. Raising
+    ``max_gross`` must let it actually reach above 1.0 -- and realized target
+    gross must still never exceed the configured ceiling.
+    """
+    bundle, days = _regime_bundle()
+
+    unlevered = _decide_regime_day(bundle, _regime_config(), days, _CALM_ROW)
+    assert unlevered.vol_scale == 1.0  # unchanged from test 12's own baseline
+    assert float(np.abs(unlevered.target_weights).sum()) == pytest.approx(1.0, abs=1e-6)
+
+    levered = _decide_regime_day(bundle, _regime_config(max_gross=2.0), days, _CALM_ROW)
+    assert levered.vol_scale > 1.0
+    realized_gross = float(np.abs(levered.target_weights).sum())
+    assert realized_gross > 1.0
+    assert realized_gross <= 2.0 + 1e-9, "realized gross must never exceed max_gross"
+
+
+def test_vol_scale_and_the_optimizers_own_gross_cap_do_not_compound_past_max_gross() -> None:
+    """The defect this pins: ``vol_scale`` multiplies ``result.weights``, which
+    is *already* gross-capped by the optimizer's own solve. Once ``vol_scale``
+    can exceed 1.0, the two compose multiplicatively rather than as one shared
+    ceiling -- measured directly on this fixture before the backstop existed:
+    an optimizer solve already at its full 2.0x allowance, scaled by a
+    vol_scale of ~1.82 (itself within its own 2.0x cap), reached 3.65x
+    realized gross. ``execute_day``'s post-scale clamp is what is being
+    tested here, not the scaler or the optimizer alone.
+    """
+    bundle, days = _regime_bundle()
+    decision = _decide_regime_day(bundle, _regime_config(max_gross=2.0), days, _CALM_ROW)
+    assert float(np.abs(decision.target_weights).sum()) <= 2.0 + 1e-9
+
+
+def test_a_flatten_with_live_views_does_not_crash_the_vol_scaler() -> None:
+    """``vol_target_scale``'s cap is now ``max_gross * governor_scale``, and a
+    flatten drives ``governor_scale`` to exactly 0.0 -- unreachable before this
+    change, since the cap was hardcoded at 1.0 regardless of the governor.
+    Verified directly against this exact fixture: without a positive floor
+    (``simulator._MIN_LEVERAGE_CAP``), this replay raises ``cap must be
+    positive, got 0.0`` on the first flatten day that still has live views.
+    """
+    bundle, _days, _closes, _symbols = _crash_bundle()
+    config = _config()
+
+    result = replay(bundle, config)  # must not raise
+
+    flattened_with_views = [d for d in result.decisions if d.governor_scale == 0.0 and d.views]
+    assert flattened_with_views, "the fixture must exercise the exact path being guarded"
+    for decision in flattened_with_views:
+        assert decision.optimizer_status in ("clarabel", "scs", "fallback_inverse_vol")
+        assert math.isfinite(decision.vol_scale)
+        assert decision.vol_scale > 0.0
+        assert float(decision.target_weights.sum()) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_max_gross_default_still_rejects_leverage_but_now_accepts_it_up_to_4x() -> None:
+    assert _config().max_gross == pytest.approx(1.0)
+    assert _config(max_gross=4.0).max_gross == pytest.approx(4.0)

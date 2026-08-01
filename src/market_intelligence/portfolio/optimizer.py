@@ -137,12 +137,24 @@ def _project(
     max_gross: float,
     groups: tuple[tuple[int, ...], ...],
     max_cluster: float,
+    beta: np.ndarray | None = None,
+    max_beta: float | None = None,
 ) -> np.ndarray:
     """Snap a solver answer onto the feasible set. Only ever reduces weights.
 
     Interior-point solvers land a hair outside a binding constraint. Returning
     that hair would let a 15% cap hold 15.0000001% for 2,500 days, so the
     caps -- not the solver's tolerance -- decide what the account holds.
+
+    ``beta``/``max_beta`` add one more cap, applied last, after gross: if the
+    projected book's beta-weighted exposure (``beta @ weights``) still exceeds
+    ``max_beta``, every weight is scaled down uniformly until it does not --
+    the same blunt instrument already used for ``max_gross``. Blunt on
+    purpose: the precise answer (trim only the high-beta names) is the
+    solver's job via the constraint added in :func:`solve_max_sharpe` /
+    :func:`solve_min_cvar`. This is the backstop -- for solver tolerance the
+    same way ``max_gross`` already is, and for :func:`fallback_weights`, which
+    has no beta awareness of its own at all.
     """
     weights = np.clip(np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0), 0.0, upper)
     weights[weights < _DUST] = 0.0
@@ -154,6 +166,16 @@ def _project(
     gross = float(weights.sum())
     if max_gross > 0.0 and gross > max_gross:
         weights *= max_gross / gross
+    if beta is not None and max_beta is not None:
+        portfolio_beta = float(np.asarray(beta, dtype=np.float64) @ weights)
+        # ``portfolio_beta > 0.0`` guards the division; a book already at or
+        # below the cap (including a non-positive beta, which uniform scaling
+        # could never have produced from non-negative weights anyway) is left
+        # alone. ``max(0.0, max_beta)`` keeps the scale non-negative even for
+        # a degenerate non-positive cap, which uniform scaling toward zero is
+        # the only way to satisfy from long-only weights.
+        if portfolio_beta > max_beta and portfolio_beta > 0.0:
+            weights = weights * (max(0.0, float(max_beta)) / portfolio_beta)
     return weights
 
 
@@ -190,11 +212,19 @@ def solve_max_sharpe(
     max_position: float,
     cluster_indices: tuple[tuple[int, ...], ...] = (),
     max_cluster: float = 1.0,
+    beta: np.ndarray | None = None,
+    max_beta: float | None = None,
 ) -> tuple[np.ndarray | None, str, float | None]:
     """Mean-variance with an L1 turnover penalty. Returns ``(w, status, value)``.
 
     ``w`` is None when every solver failed; the caller falls back. Does not
     raise.
+
+    ``beta``/``max_beta`` add ``beta @ w <= max_beta`` as a genuine solver
+    constraint when both are given -- the optimizer trims the high-beta names
+    it needs to, rather than a uniform post-hoc scale-down of the whole book.
+    Either left ``None`` (the default) adds nothing, reproducing prior
+    behaviour exactly.
     """
     try:
         raw_mu = np.asarray(mu, dtype=float).ravel()
@@ -230,6 +260,8 @@ def solve_max_sharpe(
             keep = measurable.astype(float)
             covariance = covariance * np.outer(keep, keep)
 
+        beta_vector = _as_vector(beta, size) if beta is not None else None
+
         weights = cp.Variable(size)
         objective = cp.Maximize(
             expected @ weights
@@ -238,6 +270,8 @@ def solve_max_sharpe(
         )
         constraints = [cp.sum(weights) <= gross, weights >= 0, weights <= upper]
         constraints += [cp.sum(weights[list(group)]) <= max_cluster for group in groups]
+        if beta_vector is not None and max_beta is not None:
+            constraints.append(beta_vector @ weights <= float(max_beta))
 
         problem = cp.Problem(objective, constraints)
         solver = _run_solvers(problem)
@@ -248,7 +282,13 @@ def solve_max_sharpe(
             return None, "no_solver_converged", None
 
         final = _project(
-            raw, upper=upper, max_gross=gross, groups=groups, max_cluster=max_cluster
+            raw,
+            upper=upper,
+            max_gross=gross,
+            groups=groups,
+            max_cluster=max_cluster,
+            beta=beta_vector,
+            max_beta=max_beta,
         )
         # Recomputed at the projected weights so the reported value always
         # describes the portfolio actually returned.
@@ -272,6 +312,8 @@ def solve_min_cvar(
     max_position: float,
     cluster_indices: tuple[tuple[int, ...], ...] = (),
     max_cluster: float = 1.0,
+    beta: np.ndarray | None = None,
+    max_beta: float | None = None,
 ) -> tuple[np.ndarray | None, str, float | None]:
     """Rockafellar-Uryasev CVaR LP over ``[S, N]`` scenario returns.
 
@@ -285,6 +327,9 @@ def solve_min_cvar(
     whose answer is always "don't play" is not an objective. The return term is
     what makes the tail a price worth paying rather than a thing to avoid
     absolutely.
+
+    ``beta``/``max_beta`` add ``beta @ w <= max_beta`` exactly as in
+    :func:`solve_max_sharpe`; see that docstring.
     """
     try:
         scenarios = np.asarray(scenario_returns, dtype=float)
@@ -300,6 +345,7 @@ def solve_min_cvar(
         gross = max(float(max_gross), 0.0)
         upper, groups = _bounds_and_groups(size, cluster_indices, max_position, max_cluster)
         expected = scenarios.mean(axis=0)
+        beta_vector = _as_vector(beta, size) if beta is not None else None
 
         weights = cp.Variable(size)
         var_level = cp.Variable()
@@ -316,6 +362,8 @@ def solve_min_cvar(
             weights <= upper,
         ]
         constraints += [cp.sum(weights[list(group)]) <= max_cluster for group in groups]
+        if beta_vector is not None and max_beta is not None:
+            constraints.append(beta_vector @ weights <= float(max_beta))
 
         problem = cp.Problem(objective, constraints)
         solver = _run_solvers(problem)
@@ -326,7 +374,13 @@ def solve_min_cvar(
             return None, "no_solver_converged", None
 
         final = _project(
-            raw, upper=upper, max_gross=gross, groups=groups, max_cluster=max_cluster
+            raw,
+            upper=upper,
+            max_gross=gross,
+            groups=groups,
+            max_cluster=max_cluster,
+            beta=beta_vector,
+            max_beta=max_beta,
         )
         losses = -(scenarios @ final)
         level = (
@@ -489,11 +543,20 @@ def optimize(
     clusters: dict[str, tuple[str, ...]] | None = None,
     scenario_returns: np.ndarray | None = None,
     alpha: float = _DEFAULT_CVAR_ALPHA,
+    beta: np.ndarray | None = None,
+    max_beta: float | None = None,
 ) -> OptimizerResult:
     """Solve with escalation. Never raises.
 
     ``alpha`` is the CVaR tail level and is ignored by ``max_sharpe``. It is
     last so that adding it shifts no existing call site.
+
+    ``beta``/``max_beta``, aligned to ``symbols``, cap the book's beta-weighted
+    exposure -- see :func:`solve_max_sharpe`. Both default to ``None``, adding
+    no constraint and reproducing prior behaviour exactly. The cap is enforced
+    at the solver (the precise trim) and again in the fallback projection (the
+    backstop for a degraded day and for solver tolerance), so a beta cap holds
+    even on a day the optimizer could not solve.
     """
     names = tuple(symbols)
     size = len(names)
@@ -521,6 +584,8 @@ def optimize(
                     max_position=max_position,
                     cluster_indices=groups,
                     max_cluster=max_cluster,
+                    beta=beta,
+                    max_beta=max_beta,
                 )
         else:
             weights, status_name, value = solve_max_sharpe(
@@ -533,6 +598,8 @@ def optimize(
                 max_position=max_position,
                 cluster_indices=groups,
                 max_cluster=max_cluster,
+                beta=beta,
+                max_beta=max_beta,
             )
         if weights is not None:
             weights = np.asarray(weights, dtype=float).ravel()
@@ -557,6 +624,8 @@ def optimize(
                 max_gross=max(float(max_gross), 0.0),
                 groups=groups,
                 max_cluster=max_cluster,
+                beta=_as_vector(beta, size) if beta is not None else None,
+                max_beta=max_beta,
             )
         except Exception:  # nothing below this rung; hold cash rather than raise
             weights = np.zeros(size)

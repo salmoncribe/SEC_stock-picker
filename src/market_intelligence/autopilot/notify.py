@@ -38,10 +38,12 @@ import httpx
 
 from market_intelligence.autopilot.types import ChangeKind
 from market_intelligence.logging_config import get_logger
+from market_intelligence.signals import grading
 
 if TYPE_CHECKING:
     from market_intelligence.autopilot.types import Briefing, EventAlert, SignalChange
     from market_intelligence.config import Config
+    from market_intelligence.signals.grading import GradedAlertRecord
     from market_intelligence.signals.trade_alerts import TradeAlertRecord
     from market_intelligence.signals.trade_plan import TradePlan
 
@@ -253,7 +255,15 @@ def _why_line(evidence: dict[str, object]) -> str:
     """
     event_type = evidence.get("event_type")
     basis = str(evidence.get("basis") or "").strip()
-    headline = f"{event_type} event" if event_type else "signal"
+    source_ticker = evidence.get("source_ticker")
+    target_ticker = evidence.get("target_ticker")
+    edge_type = evidence.get("edge_type")
+    if source_ticker and target_ticker and edge_type and edge_type != "self":
+        headline = f"{source_ticker}->{target_ticker} {edge_type} edge"
+        if event_type:
+            headline += f" after {event_type} event"
+    else:
+        headline = f"{event_type} event" if event_type else "signal"
     line = f"{headline}; {basis}" if basis else headline
     n_clusters = evidence.get("n_clusters")
     if n_clusters:
@@ -367,10 +377,79 @@ def send_trade_alerts(
     return _post_text(config, render_trade_alerts(records), transport=transport)
 
 
+#: One emoji per terminal outcome; anything unrecognized falls back to a
+#: neutral bullet rather than raising -- a renderer must never crash on a
+#: ledger value it doesn't yet know about.
+_OUTCOME_EMOJI: dict[str, str] = {
+    "hit_target": "✅",
+    "hit_stop": "🛑",
+    "expired": "⏳",
+}
+
+
+def _graded_alert_block(record: GradedAlertRecord) -> str:
+    """One numbered-free block: predicted plan vs. actual outcome + diagnosis.
+
+    Mirrors ``_trade_alert_block``'s shape (headline, plan, one detail line)
+    but for a *resolved* alert -- "confidence ... at fire" makes clear the
+    number is what the alert scored when it fired, not a live re-score.
+    """
+    arrow = _direction_arrow(record.direction)
+    emoji = _OUTCOME_EMOJI.get(record.outcome, "•")
+    pct = f"{(record.outcome_return or 0.0):+.2%}"
+    lines = [
+        f"{emoji} {record.ticker} {arrow} {_kind_label(record.kind)} "
+        f"(confidence {record.confidence} at fire)",
+        f"   Plan: entry ~${_fmt_price(record.entry_ref)} · "
+        f"stop ${_fmt_price(record.stop)} · target ${_fmt_price(record.target)}",
+        f"   Outcome: {record.outcome.replace('_', ' ')} ({pct})",
+        f"   {grading.diagnose(record.outcome, record.outcome_return)}",
+    ]
+    return "\n".join(lines)
+
+
+def render_graded_alerts(records: Sequence[GradedAlertRecord]) -> str:
+    """Turn today's newly-graded alerts into a plain-text Telegram message (pure, no I/O).
+
+    Its own message, separate from both the briefing nudge and the trade-alert
+    ping -- this one closes the loop on alerts that already fired, so it
+    belongs with neither. Highest confidence first, same ordering convention
+    as ``render_trade_alerts``. No block-dropping logic here: graded alerts
+    are a handful a day at most (this ledger is not yet large), so the
+    ``_SAFE_CHARS`` guard at the end is a last-resort truncation, not the
+    normal path.
+    """
+    ordered = sorted(records, key=lambda r: r.confidence, reverse=True)
+    header = f"📊 GRADED ALERTS — {len(ordered)} resolved today"
+    blocks = [_graded_alert_block(record) for record in ordered]
+    message = "\n\n".join([header, *blocks])
+    if len(message) > _SAFE_CHARS:
+        message = message[: _SAFE_CHARS - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+    return message
+
+
+def send_graded_alerts(
+    config: Config,
+    records: Sequence[GradedAlertRecord],
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> bool:
+    """Render and push graded alerts as their own Telegram message.
+
+    An empty ``records`` sequence returns ``False`` without touching the
+    network, same contract as ``send_trade_alerts``.
+    """
+    if not records:
+        return False
+    return _post_text(config, render_graded_alerts(records), transport=transport)
+
+
 __all__ = [
     "TELEGRAM_MAX_CHARS",
+    "render_graded_alerts",
     "render_message",
     "render_trade_alerts",
     "send",
+    "send_graded_alerts",
     "send_trade_alerts",
 ]

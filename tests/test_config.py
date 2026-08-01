@@ -96,6 +96,19 @@ def test_fingerprint_is_stable_and_serializable() -> None:
     assert "series" in first and "forms" in first
 
 
+def test_relationship_decision_defaults_are_research_only() -> None:
+    config = load_config(project_root=PROJECT_ROOT)
+    ready, reasons = config.relationship_decision_readiness()
+    assert not ready
+    assert set(reasons) == {
+        "relationship_decision_disabled",
+        "first_public_source_unconfigured",
+        "realtime_market_source_unconfigured",
+        "broker_read_only_source_unconfigured",
+        "live_candidate_mode_not_implemented",
+    }
+
+
 class TestTradingConfig:
     def test_model_defaults_without_yaml_entry(self) -> None:
         """Constructed directly (no settings.yaml involved) — pins the actual defaults."""

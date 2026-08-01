@@ -87,6 +87,11 @@ def _parse_args() -> argparse.Namespace:
         help="Send a Telegram message even if no new notes were built.",
     )
     parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Never send Telegram messages (extraction/projection still run normally).",
+    )
+    parser.add_argument(
         "--batch-limit",
         type=int,
         default=16,
@@ -118,7 +123,7 @@ def _run_once(config: Config, args: argparse.Namespace) -> None:
     except Exception as exc:
         state["projection_failures"] = int(state.get("projection_failures", 0)) + 1
         _log(config, f"projection skipped: {type(exc).__name__}: {exc}")
-        if _should_warn(state, "last_failure_ping_at", args.heartbeat_minutes):
+        if not args.quiet and _should_warn(state, "last_failure_ping_at", args.heartbeat_minutes):
             _send_text(
                 config,
                 "Quant graph watchdog: projection could not run.\n"
@@ -136,11 +141,13 @@ def _run_once(config: Config, args: argparse.Namespace) -> None:
     grew = written > previous_notes
     edges_grew = metrics.edges > previous_edges
 
-    if grew:
+    if args.quiet:
+        pass
+    elif grew:
         _send_text(
             config,
             "Quant Obsidian graph grew.\n"
-            f"Company notes: {previous_notes} -> {written}\n"
+            f"Vault notes: {previous_notes} -> {written}\n"
             f"Edges: {previous_edges} -> {metrics.edges}\n"
             f"Resolved edges: {metrics.resolved_edges}\n"
             f"Sources processed: {metrics.source_companies}\n"
@@ -157,7 +164,7 @@ def _run_once(config: Config, args: argparse.Namespace) -> None:
             config,
             "Quant graph watchdog heartbeat.\n"
             f"Extractor: {status} ({action})\n"
-            f"Company notes: {written}\n"
+            f"Vault notes: {written}\n"
             f"Edges: {metrics.edges}"
             + (" (new edges waiting for links)" if edges_grew else "")
             + f"\nRemaining sections: {metrics.remaining_sections}",
@@ -217,7 +224,14 @@ def _project_notes(config: Config) -> int:
     con = duckdb.connect(str(config.paths.database_path), read_only=True)
     try:
         con.execute("SET TimeZone='UTC'")
-        return graph.project_graph(con, config.paths.obsidian_vault_dir)
+        cap = config.settings.people_graph.interlock_max_companies_per_person
+        companies = graph.project_graph(
+            con, config.paths.obsidian_vault_dir, max_companies_per_person=cap
+        )
+        people = graph.project_person_notes(
+            con, config.paths.obsidian_vault_dir, max_companies_per_person=cap
+        )
+        return companies.written + people.written
     finally:
         con.close()
 

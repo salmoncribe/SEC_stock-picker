@@ -367,6 +367,25 @@ def test_render_trade_alerts_why_line_has_no_dangling_punctuation_or_double_spac
     assert "Why: price_gap event" in message
 
 
+def test_render_trade_alerts_names_propagation_edge() -> None:
+    record = _trade_alert_record(
+        ticker="NVDA",
+        evidence={
+            "event_type": "insider_transaction",
+            "basis": "active customer edge from AMD, holdout hit 65.0%, asserted 4x",
+            "source_ticker": "AMD",
+            "target_ticker": "NVDA",
+            "edge_type": "customer",
+            "n_clusters": 41,
+        },
+        edge_id="edge-AMD-NVDA-customer",
+    )
+
+    message = render_trade_alerts([record])
+
+    assert "Why: AMD->NVDA customer edge after insider_transaction event" in message
+
+
 def test_send_trade_alerts_returns_true_and_posts_rendered_text(tmp_config: Config) -> None:
     config = _with_creds(tmp_config, token="bot-token-123", chat_id="99887766")
     records = [_trade_alert_record()]

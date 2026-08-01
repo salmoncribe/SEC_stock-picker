@@ -14,35 +14,59 @@ afterwards is exactly this run's promotions and demotions. Once the briefing is
 assembled, its fired alerts are projected into the trade-alert ledger (plan,
 confidence, persistence) and the confident ones are pushed to Telegram as a
 best-effort tail step that can never sink the briefing itself.
+
+The loop also bookkeeps one ``pipeline_runs`` row of its own, ``pipeline_name
+"autopilot"`` -- see ``_start_autopilot_run``/``_finish_autopilot_run``. Every
+step already writes its own row, but nothing external could previously ask
+"is today's *loop* running, and since when" without knowing every step's name
+and reasoning about which one is currently mid-flight. That row is what
+``scripts/watch_autopilot.py`` would read if it needed a DB-backed signal --
+in practice it does not (see that script's docstring for why polling the DB
+during a suspected hang is unreliable), so this row exists mainly as an
+honest, queryable record of each day's wall-clock run, independent of the
+per-step ledger.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 
-from market_intelligence import database
+import duckdb
+
+from market_intelligence import dashboard_snapshot, database
 from market_intelligence.autopilot import briefing as briefing_builder
 from market_intelligence.autopilot import notify, obsidian, ram_guard
 from market_intelligence.autopilot.types import Briefing, RunStatus
+from market_intelligence.collectors import config_hash, make_run_id
 from market_intelligence.collectors import filing_events as filing_events_collector
 from market_intelligence.collectors import prices as price_collector
 from market_intelligence.collectors import returns as returns_collector
 from market_intelligence.logging_config import get_logger
 from market_intelligence.signals import dataset as dataset_builder
-from market_intelligence.signals import grading
+from market_intelligence.signals import gap_calibration, grading
 from market_intelligence.signals import impact as impact_gate
 from market_intelligence.signals import trade_alerts as trade_alerts_builder
+from market_intelligence.storage import duckdb as duckdb_store
 
 if TYPE_CHECKING:
-    import duckdb
-
     from market_intelligence.collectors import RunSummary
     from market_intelligence.config import Config
 
 logger = get_logger(__name__)
+
+# graph-watchdog (every 10 minutes) holds the DuckDB single-writer lock for
+# ~8 of those 10 minutes while extracting relationships via the local LLM
+# (see logs/extract_relationships.log timings). A 6am collision with that
+# window used to crash the whole daily loop outright (2026-07-28: autopilot
+# raised IOException before it could gate or send a single alert). This
+# budget -- up to 19 * 45s ~= 14.25 minutes of retrying -- comfortably
+# outlasts one full watchdog cycle regardless of where in it we land.
+_AUTOPILOT_DB_BUSY_MAX_ATTEMPTS = 20
+_AUTOPILOT_DB_BUSY_RETRY_SECONDS = 45.0
 
 
 @dataclass(frozen=True)
@@ -68,16 +92,36 @@ def default_steps() -> list[Step]:
     dataset that reads them, and the dataset before the gate that judges it.
     Grading of yesterday's open alerts runs right after returns, once today's
     bars exist to grade against, but before the gate -- it is a non-critical
-    housekeeping step, not part of what the gate judges. The gate is the only
-    critical step -- everything upstream is best-effort enrichment of what it
-    will measure.
+    housekeeping step, not part of what the gate judges. Gap calibration runs
+    immediately after grading, on the same freshly-graded data, so that any
+    ``price_gap`` alert built later in this same run (or by tomorrow's
+    ``gaps.scan``) sees today's outcomes reflected in its bucket lookup. The
+    gate is the only critical step -- everything upstream is best-effort
+    enrichment of what it will measure.
     """
     return [
         Step("sync-prices", lambda c: price_collector.sync(c)),
         Step("compute-returns", lambda c: returns_collector.compute(c)),
         Step("grade-trade-alerts", lambda c: grading.grade(c)),
+        Step("calibrate-gap-confidence", lambda c: gap_calibration.recompute_step(c)),
         Step("sync-filing-events", lambda c: filing_events_collector.sync(c)),
-        Step("build-dataset", lambda c: dataset_builder.build(c)),
+        # build_incremental() replaced build() 2026-07-30: build() recomputes
+        # every symbol's full (events x horizons) cross product on every run,
+        # so its cost scales with total historical dataset size rather than
+        # with what actually changed -- the real cause of this step alone
+        # taking 1.5-2.5+ hours and growing worse daily. build_incremental()
+        # is proven byte-identical to build() (see
+        # tests/test_dataset_incremental.py's simulated-days equivalence
+        # test, which explicitly covers a previously-unmeasurable event
+        # becoming measurable once its symbol's return series is extended).
+        Step("build-dataset", lambda c: dataset_builder.build_incremental(c)),
+        # Pulled from the daily critical path 2026-07-29: the 6am run hung for
+        # 3h40m on an N+1 events-per-edge query pattern (fixed), then a second
+        # clean run hit a genuine duplicate-key collision on insert plus a
+        # storage.upsert() cost that scans the whole event_samples table per
+        # call -- fine when that table was small, not once propagation rows
+        # are in it. Re-enable once both are fixed; see project memory.
+        # Step("build-propagation", lambda c: dataset_builder.build_propagation(c)),
         Step("evaluate", lambda c: impact_gate.evaluate(c), critical=True),
     ]
 
@@ -95,6 +139,8 @@ def _ingest_counts(results: dict[str, RunSummary]) -> dict[str, int]:
         counts["new_events"] = results["sync-filing-events"].inserted
     if "build-dataset" in results:
         counts["samples_built"] = results["build-dataset"].inserted
+    if "build-propagation" in results:
+        counts["propagation_samples_built"] = results["build-propagation"].inserted
     if "evaluate" in results:
         counts["cells_evaluated"] = results["evaluate"].stage.get("signals_tracked", 0)
     return counts
@@ -175,12 +221,169 @@ def _send_trade_alerts(
         logger.error("autopilot_trade_alerts_stamp_failed", error=str(exc))
 
 
+def _send_graded_alerts(
+    config: Config, records: Sequence[grading.GradedAlertRecord]
+) -> None:
+    """Push today's newly-resolved alerts to Telegram; never raise.
+
+    Unlike ``_send_trade_alerts`` there is no ledger stamp to write
+    afterward -- grading already wrote ``outcome``/``outcome_return``/
+    ``graded_at`` onto these rows the moment they resolved; this step is
+    read-only, purely a notification about a fact the ledger already
+    recorded.
+    """
+    if not records:
+        return
+    notify.send_graded_alerts(config, records)
+
+
+def _snapshot_ladder(config: Config) -> dict[briefing_builder.CellKey, str]:
+    """Open, read, close -- a full cycle ``with_db_retry`` can safely redo."""
+    with database.connection(config.paths.database_path) as con:
+        database.init_db(con)
+        return briefing_builder.snapshot_statuses(con)
+
+
+def _gate_and_build_briefing(
+    config: Config,
+    *,
+    briefing_date: date,
+    run_status: str,
+    results: dict[str, RunSummary],
+    before: dict[briefing_builder.CellKey, str],
+    notes: list[str],
+) -> tuple[
+    Briefing,
+    list[trade_alerts_builder.TradeAlertRecord],
+    Sequence[grading.GradedAlertRecord],
+    Sequence[gap_calibration.GapCalibrationRow],
+    dict[str, object],
+]:
+    """Open, gate, build, close -- a full cycle ``with_db_retry`` can redo."""
+    with database.connection(config.paths.database_path) as con:
+        database.init_db(con)
+        # The pre-run snapshot captured above is diffed against the ladder now.
+        # On a FAILED run the gate never advanced it, so the diff is empty and
+        # the briefing carries only the failure notes -- the honest report.
+        briefing = briefing_builder.build(
+            con,
+            as_of=briefing_date,
+            run_status=run_status,
+            ingest=_ingest_counts(results),
+            before=before,
+            notes=notes,
+        )
+        sendable_records = _project_trade_alerts(con, briefing, config, briefing_date)
+        # Self-contained reads, same shape as _project_trade_alerts above: no
+        # state is threaded from the calibrate-gap-confidence or
+        # grade-trade-alerts steps, this just re-reads the ledger directly by
+        # date so it stays correct even if a future step ordering changes.
+        graded_today = grading.load_graded_today(con, briefing_date)
+        calibration_rows = gap_calibration.load_all(con)
+        dashboard_payload = dashboard_snapshot.build_snapshot(con, config, briefing)
+    return briefing, sendable_records, graded_today, calibration_rows, dashboard_payload
+
+
+def _start_autopilot_run(config: Config, *, sleep: Callable[[float], None]) -> str | None:
+    """Open, insert the whole-loop ``pipeline_runs`` row, close; return its id.
+
+    A short connect-write-close cycle, the same idiom ``_snapshot_ladder`` and
+    ``_gate_and_build_briefing`` already use -- not the ``pipeline_run``
+    context manager every step uses, because that one holds a connection open
+    for its whole body and re-raises on exception, and this loop's own
+    contract is the opposite of both: never hold the DB longer than one write
+    needs, and never raise out of ``run`` no matter what.
+
+    Deliberately a *small* retry budget (``with_db_retry``'s plain default:
+    3 attempts, 30s apart), unlike the generous
+    ``_AUTOPILOT_DB_BUSY_MAX_ATTEMPTS`` budget the snapshot/gate phases use
+    below. This row is supplementary bookkeeping, not core to the run -- if
+    the lock is contended enough to still be busy after ~90s, it is cheaper
+    to skip the row for today (returning ``None``, which makes
+    ``_finish_autopilot_run`` a no-op) than to spend minutes of the run's own
+    budget on a write nothing downstream depends on.
+    """
+    run_id = make_run_id()
+    started = datetime.now(tz=UTC)
+
+    def _write() -> None:
+        with database.connection(config.paths.database_path) as con:
+            database.init_db(con)
+            duckdb_store.start_pipeline_run(con, run_id, "autopilot", started, config_hash(config))
+
+    try:
+        database.with_db_retry(_write, sleep=sleep)
+    except duckdb.IOException as exc:
+        logger.error("autopilot_run_row_start_failed", error=str(exc))
+        return None
+    return run_id
+
+
+def _finish_autopilot_run(
+    config: Config, run_id: str | None, *, status: str, sleep: Callable[[float], None]
+) -> None:
+    """Close the whole-loop ``pipeline_runs`` row; never raise, no-op on ``None``.
+
+    Called from every exit path of ``run`` -- both ``_db_busy_failure`` escape
+    hatches and the normal return -- so the row's ``status`` always lands on
+    whatever this run actually ended as (one of ``RunStatus``'s three values).
+    If this write itself cannot land, or the start row never landed, the row
+    is simply left as it was (``status='running'`` with its original
+    ``started_time``, or absent entirely) -- which is exactly the state a
+    genuinely stuck run leaves behind, so a watchdog reading this table later
+    still sees the truth rather than a falsely-clean row.
+    """
+    if run_id is None:
+        return
+
+    def _write() -> None:
+        with database.connection(config.paths.database_path) as con:
+            database.init_db(con)
+            duckdb_store.finish_pipeline_run(
+                con,
+                run_id,
+                status=status,
+                completed_time=datetime.now(tz=UTC),
+                collected=0,
+                inserted=0,
+                updated=0,
+                rejected=0,
+            )
+
+    try:
+        database.with_db_retry(_write, sleep=sleep)
+    except duckdb.IOException as exc:
+        logger.error("autopilot_run_row_finish_failed", error=str(exc))
+
+
+def _db_busy_failure(
+    config: Config, briefing_date: date, *, phase: str, error: duckdb.IOException
+) -> Briefing:
+    """Give up on a DB-busy run: still emit and push a FAILED briefing.
+
+    Reached only once the retry budget above is exhausted -- the lock-holder
+    (almost always graph-watchdog's extraction pass) never let go. The run
+    can't gate or read the ledger, but per this module's own rule -- silence
+    must never look like success -- it still writes the note and pushes the
+    Telegram nudge naming the failure, rather than raising and going dark.
+    """
+    logger.error("autopilot_db_busy_failed", phase=phase, error=str(error))
+    briefing = Briefing(
+        as_of=briefing_date,
+        run_status=RunStatus.FAILED,
+        notes=[f"step {phase} FAILED: database busy after retries: {error}"],
+    )
+    _deliver(config, briefing)
+    return briefing
+
+
 def run(
     config: Config,
     *,
     as_of: date | None = None,
     steps: list[Step] | None = None,
     now: datetime | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> Briefing:
     """Run the daily loop and return the briefing it produced.
 
@@ -188,17 +391,28 @@ def run(
     still emits a FAILED briefing naming what broke, because a loop that goes
     quiet on failure is indistinguishable from one that had nothing to say.
     ``as_of`` and ``now`` are injectable so the loop is testable without the
-    real clock.
+    real clock; so is ``sleep``, which the DB-busy retry below uses instead of
+    a real wait in tests.
     """
     config.paths.ensure()
     plan = steps if steps is not None else default_steps()
     briefing_date = as_of or (now or datetime.now(tz=UTC)).date()
+    run_id = _start_autopilot_run(config, sleep=sleep)
 
     # Snapshot the ladder before the gate runs, so the post-run diff is exactly
-    # this run's transitions.
-    with database.connection(config.paths.database_path) as con:
-        database.init_db(con)
-        before = briefing_builder.snapshot_statuses(con)
+    # this run's transitions. Retried across the DuckDB single-writer lock --
+    # see _AUTOPILOT_DB_BUSY_MAX_ATTEMPTS above for why.
+    try:
+        before = database.with_db_retry(
+            lambda: _snapshot_ladder(config),
+            sleep=sleep,
+            max_attempts=_AUTOPILOT_DB_BUSY_MAX_ATTEMPTS,
+            retry_seconds=_AUTOPILOT_DB_BUSY_RETRY_SECONDS,
+        )
+    except duckdb.IOException as exc:
+        briefing = _db_busy_failure(config, briefing_date, phase="snapshot", error=exc)
+        _finish_autopilot_run(config, run_id, status=briefing.run_status, sleep=sleep)
+        return briefing
 
     results: dict[str, RunSummary] = {}
     notes: list[str] = _check_ram(config)
@@ -220,35 +434,64 @@ def run(
             run_status = RunStatus.PARTIAL
             notes.append(f"step {step.name} reported status={summary.status}")
 
-    with database.connection(config.paths.database_path) as con:
-        database.init_db(con)
-        # The pre-run snapshot captured above is diffed against the ladder now.
-        # On a FAILED run the gate never advanced it, so the diff is empty and
-        # the briefing carries only the failure notes -- the honest report.
-        briefing = briefing_builder.build(
-            con,
-            as_of=briefing_date,
-            run_status=run_status,
-            ingest=_ingest_counts(results),
-            before=before,
-            notes=notes,
+    try:
+        (
+            briefing,
+            sendable_records,
+            graded_today,
+            calibration_rows,
+            dashboard_payload,
+        ) = database.with_db_retry(
+            lambda: _gate_and_build_briefing(
+                config,
+                briefing_date=briefing_date,
+                run_status=run_status,
+                results=results,
+                before=before,
+                notes=notes,
+            ),
+            sleep=sleep,
+            max_attempts=_AUTOPILOT_DB_BUSY_MAX_ATTEMPTS,
+            retry_seconds=_AUTOPILOT_DB_BUSY_RETRY_SECONDS,
         )
-        sendable_records = _project_trade_alerts(con, briefing, config, briefing_date)
+    except duckdb.IOException as exc:
+        briefing = _db_busy_failure(config, briefing_date, phase="gate", error=exc)
+        _finish_autopilot_run(config, run_id, status=briefing.run_status, sleep=sleep)
+        return briefing
 
-    _deliver(config, briefing)
+    try:
+        path = dashboard_snapshot.write_snapshot(config, dashboard_payload)
+        logger.info("dashboard_snapshot_written", path=str(path))
+    except OSError as exc:
+        logger.error("dashboard_snapshot_failed", error=str(exc))
+
+    _deliver(config, briefing, graded_today=graded_today, calibration_rows=calibration_rows)
     _send_trade_alerts(config, sendable_records)
+    _send_graded_alerts(config, graded_today)
 
+    _finish_autopilot_run(config, run_id, status=briefing.run_status, sleep=sleep)
     return briefing
 
 
-def _deliver(config: Config, briefing: Briefing) -> None:
+def _deliver(
+    config: Config,
+    briefing: Briefing,
+    *,
+    graded_today: Sequence[grading.GradedAlertRecord] = (),
+    calibration_rows: Sequence[gap_calibration.GapCalibrationRow] = (),
+) -> None:
     """Write the Obsidian note and push the Telegram nudge; never raise.
 
     Delivery is best-effort: a down notifier or an unwritable vault must not
     fail a run whose real work -- gating and recording -- already succeeded.
     """
     try:
-        path = obsidian.write_daily_note(config.paths.obsidian_vault_dir, briefing)
+        path = obsidian.write_daily_note(
+            config.paths.obsidian_vault_dir,
+            briefing,
+            graded_today=graded_today,
+            calibration_rows=calibration_rows,
+        )
         logger.info("autopilot_note_written", path=str(path))
     except OSError as exc:
         logger.error("autopilot_note_failed", error=str(exc))

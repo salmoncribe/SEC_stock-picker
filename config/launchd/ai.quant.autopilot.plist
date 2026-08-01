@@ -8,6 +8,23 @@
   live. A missing Telegram token just skips the nudge; the Obsidian note is
   written regardless.
 
+  Wrapped in `gtimeout` (coreutils; `brew install coreutils`) as a hard
+  wall-clock kill: a 2026-07 incident let this run hang 5+ hours a day for
+  several days straight on a pathological query (since fixed), blocking the
+  DuckDB write lock the whole time and never reaching the point where it could
+  say so. Ceiling raised from 120m to 240m on 2026-07-30: the first live run
+  under the 120m ceiling was killed by this very wrapper mid-`build-dataset`
+  (exit 124) after legitimately churning the whole time (bounded memory,
+  steady progress, no errors) -- 120m was too tight for a real catch-up-sized
+  run, not just for a hang. 240m is still nowhere near the 5-hour hangs this
+  replaces, but gives a legitimately slow day room to finish instead of being
+  killed one step short of sending the briefing. `--kill-after=2m` is defense
+  in depth in case SIGTERM alone doesn't land; SIGTERM itself (gtimeout's
+  default signal, sent first) gives DuckDB the same clean chance to flush its
+  WAL that this exact process has already survived empirically across several
+  forced kills. `scripts/watch_autopilot.py` (ai.quant.autopilot-watchdog.plist)
+  is the second, independent layer in case this wrapper itself doesn't fire.
+
   Install:
     cp config/launchd/ai.quant.autopilot.plist ~/Library/LaunchAgents/
     launchctl load ~/Library/LaunchAgents/ai.quant.autopilot.plist
@@ -27,7 +44,7 @@
     <array>
         <string>/bin/zsh</string>
         <string>-lc</string>
-        <string>cd /Users/michaeltadlock/quant &amp;&amp; /opt/homebrew/bin/uv run market-intelligence autopilot run</string>
+        <string>cd /Users/michaeltadlock/quant &amp;&amp; /opt/homebrew/bin/gtimeout --signal=TERM --kill-after=2m 240m /opt/homebrew/bin/uv run market-intelligence autopilot run</string>
     </array>
 
     <key>StartCalendarInterval</key>
@@ -38,9 +55,14 @@
         <integer>0</integer>
     </dict>
 
-    <!-- If the mini was asleep at 06:00, run as soon as it wakes. -->
+    <!-- Runs immediately whenever this agent is (re)loaded -- at login/reboot,
+         or the next time launchd reloads it -- so a 06:00 slot missed because
+         the mini was asleep gets caught up rather than silently skipped for
+         the whole day. Was `<false/>` with a comment claiming this same
+         catch-up intent, which was the actual bug: RunAtLoad was never doing
+         what the comment said. Fixed 2026-07-30. -->
     <key>RunAtLoad</key>
-    <false/>
+    <true/>
 
     <key>StandardOutPath</key>
     <string>/Users/michaeltadlock/quant/logs/autopilot.out.log</string>

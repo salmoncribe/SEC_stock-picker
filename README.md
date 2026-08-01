@@ -56,6 +56,37 @@ with that output is the operator's decision and responsibility.
 
 ## What it does today
 
+### Research backtesting environment
+
+The portfolio replay environment lives in
+`market_intelligence.analytics.backtest`. It accepts point-in-time signals and
+stored OHLC bars, enters on the next available bar, applies ATR-based plans,
+models entry/exit slippage and commissions, and reports return, drawdown,
+Sharpe, win rate, profit factor, and expectancy. `optimize()` tunes parameters
+on the pre-registered discovery period and evaluates the frozen choice once on
+the chronological holdout period.
+
+```python
+from datetime import date
+
+from market_intelligence.analytics.backtest import (
+    BacktestConfig, BacktestSignal, optimize,
+)
+
+config, discovery, holdout = optimize(
+    signals,
+    bars_by_symbol,
+    BacktestConfig(starting_equity=10_000, entry_slippage_bps=5, exit_slippage_bps=5),
+    split_date=date(2023, 1, 1),
+)
+print(config.atr_stop_multiple, discovery.objective, holdout.total_return)
+```
+
+This is intentionally a research harness rather than an execution system.
+The signal list must be generated from information available on each signal's
+date; the environment does not manufacture historical signals or permit
+look-ahead.
+
 - **SEC EDGAR**
   - Downloads the company **ticker → CIK** map and stores the company universe.
   - Retrieves a company's **submission history** by CIK and normalizes filing
@@ -225,6 +256,21 @@ uv run market-intelligence init-db
 
 Creates `data/database/market_intelligence.duckdb` and all tables. Idempotent —
 safe to run again.
+
+### Local dashboard
+
+From this project directory, run:
+
+```bash
+PAGE
+```
+
+It opens a local dashboard at `http://127.0.0.1:8765` and keeps the terminal
+free. The view is read-only: open predictions are marked against the latest
+stored price, resolved calls show their recorded outcome, and the page links
+straight into the local Obsidian vault. If the data pipeline currently owns the
+DuckDB lock, `PAGE` keeps the last good dashboard snapshot and refreshes it as
+soon as a completed autopilot pass writes the next one.
 
 ---
 

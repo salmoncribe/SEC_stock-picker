@@ -23,6 +23,8 @@ from market_intelligence.autopilot import notify
 from market_intelligence.clients.market import LatestPrice, MarketDataProvider
 from market_intelligence.collectors import gaps
 from market_intelligence.config import Config
+from market_intelligence.schemas.common import utcnow
+from market_intelligence.signals import gap_calibration
 from market_intelligence.signals.trade_plan import Bar, wilder_atr
 from market_intelligence.storage import duckdb as duckdb_store
 
@@ -451,6 +453,176 @@ def test_quote_fetch_paces_between_calls(tmp_config: Config) -> None:
     # 3 survivors -> pauses between calls, not before/after -> len - 1.
     assert len(quote_pauses) == len(tickers) - 1
     assert len(quote_pauses) >= 1
+
+
+def _seed_calibration_row(config: Config, **fields: Any) -> None:
+    row = {
+        "bucket_id": "bucket",
+        "direction": 1,
+        "gap_size_bucket": "medium",
+        "catalyst_present": False,
+        "n_decisive": 10,
+        "n_expired": 2,
+        "hit_rate": 0.7,
+        "mean_return": 0.03,
+        "last_updated": utcnow(),
+    }
+    row.update(fields)
+    with database.connection(config.paths.database_path) as con:
+        database.init_db(con)
+        con.execute(
+            "INSERT INTO gap_calibration_stats "
+            "(bucket_id, direction, gap_size_bucket, catalyst_present, "
+            "n_decisive, n_expired, hit_rate, mean_return, last_updated) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                row["bucket_id"],
+                row["direction"],
+                row["gap_size_bucket"],
+                row["catalyst_present"],
+                row["n_decisive"],
+                row["n_expired"],
+                row["hit_rate"],
+                row["mean_return"],
+                row["last_updated"],
+            ],
+        )
+
+
+# --------------------------------------------------------------------------- #
+# gap calibration wiring (no-regression + earned track record)                #
+# --------------------------------------------------------------------------- #
+def test_no_regression_confidence_capped_when_calibration_table_is_empty(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The single most important test in this module: with
+    ``gap_calibration_stats`` empty (today's real production state -- 93 open
+    price_gap alerts, 0 graded), every candidate must score IDENTICALLY to the
+    pre-calibration hardcoded behaviour: ``has_track_record=False``,
+    ``hit_rate=None``, ``n_clusters=0``. Nothing about wiring the calibration
+    lookup into ``_build_candidate`` may change today's live scoring."""
+    n = tmp_config.settings.trading.atr_period * 4
+    end = AS_OF - timedelta(days=1)
+    _seed_constituents(tmp_config, ["GAPX"])
+    rows = _seed_prices(tmp_config, "GAPX", end=end, n=n)
+    quote = rows[-1]["close"] * 1.05
+    provider = _StubProvider({"GAPX": LatestPrice(symbol="GAPX", price=quote, as_of=AS_OF)})
+
+    captured: dict[str, Any] = {}
+    original_score = gaps.score
+
+    def spy_score(inputs: Any) -> int:
+        captured["inputs"] = inputs
+        return original_score(inputs)
+
+    monkeypatch.setattr(gaps, "score", spy_score)
+
+    summary = gaps.scan(tmp_config, provider=provider, as_of=AS_OF, notify=False)
+    assert summary.status == "success"
+
+    assert "inputs" in captured
+    assert captured["inputs"].has_track_record is False
+    assert captured["inputs"].hit_rate is None
+    assert captured["inputs"].n_clusters == 0
+
+    rows_out = _trade_alert_rows(tmp_config)
+    assert len(rows_out) == 1
+    assert rows_out[0]["confidence"] <= 50
+    evidence = json.loads(rows_out[0]["evidence"])
+    assert evidence["note"] == "no track record yet"
+
+
+def test_confidence_uses_calibrated_bucket_when_decisive_history_exists(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once a matching bucket has graded, decisive history, the candidate
+    must use it: has_track_record flips True and the shrunk hit rate/sample
+    size come from the bucket, not the hardcoded no-track-record cap."""
+    n = tmp_config.settings.trading.atr_period * 4
+    end = AS_OF - timedelta(days=1)
+    _seed_constituents(tmp_config, ["GAPX"])
+    rows = _seed_prices(tmp_config, "GAPX", end=end, n=n)
+    prior_close = rows[-1]["close"]
+    quote = prior_close * 1.05  # +5% gap -> "medium" bucket, direction=1, no catalyst
+    provider = _StubProvider({"GAPX": LatestPrice(symbol="GAPX", price=quote, as_of=AS_OF)})
+
+    bucket_key = gap_calibration.bucket_id(1, "medium", False)
+    _seed_calibration_row(
+        tmp_config,
+        bucket_id=bucket_key,
+        direction=1,
+        gap_size_bucket="medium",
+        catalyst_present=False,
+        n_decisive=12,
+        n_expired=3,
+        hit_rate=0.75,
+        mean_return=0.04,
+    )
+
+    captured: dict[str, Any] = {}
+    original_score = gaps.score
+
+    def spy_score(inputs: Any) -> int:
+        captured["inputs"] = inputs
+        return original_score(inputs)
+
+    monkeypatch.setattr(gaps, "score", spy_score)
+
+    summary = gaps.scan(tmp_config, provider=provider, as_of=AS_OF, notify=False)
+    assert summary.status == "success"
+
+    assert "inputs" in captured
+    assert captured["inputs"].has_track_record is True
+    assert captured["inputs"].hit_rate == pytest.approx(0.75)
+    assert captured["inputs"].n_clusters == 12
+
+    rows_out = _trade_alert_rows(tmp_config)
+    assert len(rows_out) == 1
+    evidence = json.loads(rows_out[0]["evidence"])
+    assert "calibrated on n=12 decisive outcomes" in evidence["note"]
+
+    # A 75% shrunk hit rate with n=12 clears the daily path's own 60-point
+    # floor, unlike the hardcoded 50-point cap -- proof the earned track
+    # record actually moves the number, not just the ConfidenceInputs shape.
+    assert rows_out[0]["confidence"] > 50
+
+
+def test_calibrated_bucket_is_specific_not_global(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A calibration row for an unrelated bucket (opposite direction) must not
+    leak into a candidate that doesn't match it."""
+    n = tmp_config.settings.trading.atr_period * 4
+    end = AS_OF - timedelta(days=1)
+    _seed_constituents(tmp_config, ["GAPX"])
+    rows = _seed_prices(tmp_config, "GAPX", end=end, n=n)
+    quote = rows[-1]["close"] * 1.05  # up-gap -> direction=1
+    provider = _StubProvider({"GAPX": LatestPrice(symbol="GAPX", price=quote, as_of=AS_OF)})
+
+    # Seed a calibrated bucket for the *down*-gap side only.
+    _seed_calibration_row(
+        tmp_config,
+        bucket_id=gap_calibration.bucket_id(-1, "medium", False),
+        direction=-1,
+        gap_size_bucket="medium",
+        catalyst_present=False,
+        n_decisive=20,
+        hit_rate=0.9,
+    )
+
+    captured: dict[str, Any] = {}
+    original_score = gaps.score
+
+    def spy_score(inputs: Any) -> int:
+        captured["inputs"] = inputs
+        return original_score(inputs)
+
+    monkeypatch.setattr(gaps, "score", spy_score)
+
+    gaps.scan(tmp_config, provider=provider, as_of=AS_OF, notify=False)
+
+    assert captured["inputs"].has_track_record is False
+    assert captured["inputs"].hit_rate is None
 
 
 def test_provider_errors_over_half_marks_run_partial(tmp_config: Config) -> None:

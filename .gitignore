@@ -34,6 +34,12 @@ data/database/**
 logs/*.log
 logs/**/*.log
 
+# Runtime state written by the watchdogs: a lock file and a liveness snapshot.
+# Both are per-machine and change on every run, so committing them would mean a
+# dirty tree after every scheduled job.
+logs/*.lock
+logs/*_state.json
+
 # ---- OS / editor ----
 .DS_Store
 .idea/

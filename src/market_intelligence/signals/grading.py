@@ -74,6 +74,95 @@ if TYPE_CHECKING:
     from market_intelligence.collectors import RunSummary
     from market_intelligence.config import Config
 
+
+@dataclass(frozen=True)
+class GradedAlertRecord:
+    """One trade alert that resolved today: the fired plan + the actual outcome.
+
+    A read-side projection of a ``trade_alerts`` row -- not the full ledger
+    schema, just what the graded-alerts notification (Telegram and Obsidian)
+    needs to show predicted vs. actual side by side.
+    """
+
+    alert_id: str
+    ticker: str
+    kind: str
+    direction: int
+    entry_ref: float
+    stop: float
+    target: float
+    confidence: int
+    outcome: str
+    outcome_return: float | None
+
+
+def load_graded_today(con: duckdb.DuckDBPyConnection, as_of: date) -> list[GradedAlertRecord]:
+    """Every alert whose ``graded_at`` falls on ``as_of`` -- a self-contained read.
+
+    Deliberately re-reads the ledger by date rather than accepting a list
+    handed down from the ``grade-trade-alerts`` step, matching this module's
+    (and ``_project_trade_alerts``'s) house pattern of each orchestrator stage
+    re-querying rather than threading state -- so this stays correct even if
+    a future run calls ``grade_open_alerts`` more than once in a day, or the
+    step ordering changes. ``as_of`` is the injectable clock the rest of the
+    daily loop already uses (see ``grade``'s own ``as_of`` param), not
+    ``CURRENT_DATE``, so this is testable without depending on the real
+    calendar date the suite happens to run on.
+    """
+    rows = con.execute(
+        "SELECT alert_id, ticker, kind, direction, entry_ref, stop, target, "
+        "confidence, outcome, outcome_return FROM trade_alerts "
+        "WHERE outcome != 'open' AND CAST(graded_at AS DATE) = ?",
+        [as_of],
+    ).fetchall()
+    return [
+        GradedAlertRecord(
+            alert_id=r[0],
+            ticker=r[1],
+            kind=r[2],
+            direction=r[3],
+            entry_ref=r[4],
+            stop=r[5],
+            target=r[6],
+            confidence=r[7],
+            outcome=r[8],
+            outcome_return=r[9],
+        )
+        for r in rows
+    ]
+
+
+def diagnose(outcome: str, outcome_return: float | None) -> str:
+    """One deterministic, auditable sentence explaining a graded outcome.
+
+    No LLM: this is a pure function of the two values already on the ledger
+    row, matching the "the number can be audited rather than believed"
+    philosophy from ``signals/confidence.py``. Shared verbatim between the
+    Telegram notifier and the Obsidian note (both call this) so the two
+    surfaces can never say different things about the same graded row.
+
+    ``outcome_return`` is already direction-adjusted by ``_grade_one`` above
+    (``ret = direction * (exit_adj - entry_adj) / entry_adj``) -- positive
+    always means "moved in the position's favor", regardless of whether the
+    position was long or short. So an ``expired`` row is classified purely on
+    the sign of ``outcome_return`` itself; comparing it against ``direction``
+    a second time would double-apply the adjustment and flip the verdict
+    backwards for every short.
+    """
+    if outcome == "hit_target":
+        return "Target hit — gap continued as predicted."
+    if outcome == "hit_stop":
+        return "Stopped out — gap reversed against the position."
+    if outcome == "expired":
+        pct = f"{(outcome_return or 0.0):+.2%}"
+        if outcome_return is not None and outcome_return > 0:
+            return (
+                f"Expired without a clean hit — drifted toward target ({pct}) "
+                "but ran out of time."
+            )
+        return f"Expired without a clean hit — drifted against the position ({pct})."
+    return f"Outcome: {outcome}."
+
 logger = get_logger(__name__)
 
 #: Outcomes ``grade_open_alerts`` can produce, and the zero-filled shape of
@@ -282,4 +371,10 @@ def grade(config: Config, as_of: date | None = None) -> RunSummary:
     return summary
 
 
-__all__ = ["grade", "grade_open_alerts"]
+__all__ = [
+    "GradedAlertRecord",
+    "diagnose",
+    "grade",
+    "grade_open_alerts",
+    "load_graded_today",
+]

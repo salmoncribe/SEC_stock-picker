@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+import duckdb
 import pytest
 
 from market_intelligence import database
@@ -72,12 +73,46 @@ def _seed_event(
         "event_key": f"{ticker}:{subtype}:{available.date()}",
         "event_subtype": subtype,
         "ticker": ticker,
+        # The propagation alert join matches this against company_edges.source_cik
+        # (a ticker is reassigned between companies; a CIK is not), so an event
+        # seeded without one can never reach an edge. Same convention _seed_edge
+        # uses, so an event and an edge named for the same ticker are the same filer.
+        "cik": f"cik-{ticker}",
         "available_time": available,
         "extraction_confidence": extraction_confidence,
     }
     with database.connection(config.paths.database_path) as con:
         database.init_db(con)
         duckdb_store.upsert_events(con, [row])
+
+
+def _seed_edge(
+    config: Config,
+    *,
+    source_ticker: str,
+    target_ticker: str,
+    edge_type: str = "customer",
+    times_asserted: int = 3,
+    extraction_confidence: float = 0.82,
+) -> None:
+    row = {
+        "edge_id": f"edge-{source_ticker}-{target_ticker}-{edge_type}",
+        "edge_key": f"{source_ticker}:{target_ticker}:{edge_type}",
+        "source_cik": f"cik-{source_ticker}",
+        "source_ticker": source_ticker,
+        "target": target_ticker,
+        "target_name": target_ticker,
+        "target_ticker": target_ticker,
+        "edge_type": edge_type,
+        "resolution_status": "resolved",
+        "resolution_confidence": 0.95,
+        "extraction_confidence": extraction_confidence,
+        "times_asserted": times_asserted,
+        "validation_status": "valid",
+    }
+    with database.connection(config.paths.database_path) as con:
+        database.init_db(con)
+        duckdb_store.upsert_company_edges(con, [row])
 
 
 def _price_row(symbol: str, price_date: date, close: float) -> dict[str, Any]:
@@ -205,6 +240,45 @@ def test_recent_event_through_active_cell_fires_an_alert(tmp_config: Config) -> 
     assert alerts[0].extraction_confidence == 0.87
 
 
+def test_recent_event_through_active_edge_cell_fires_target_alert(tmp_config: Config) -> None:
+    _seed_status(
+        tmp_config,
+        subtype="P",
+        horizon=20,
+        status=LadderStatus.ACTIVE.value,
+        edge="customer",
+        mean_car=0.04,
+        hit_rate=0.66,
+    )
+    _seed_event(
+        tmp_config,
+        ticker="AMD",
+        subtype="P",
+        available=datetime(2026, 7, 22, tzinfo=UTC),
+        extraction_confidence=0.87,
+    )
+    _seed_edge(
+        tmp_config,
+        source_ticker="AMD",
+        target_ticker="NVDA",
+        edge_type="customer",
+        times_asserted=4,
+    )
+
+    with database.connection(tmp_config.paths.database_path) as con:
+        alerts = briefing_builder.event_alerts(con, as_of=AS_OF, lookback_days=4)
+
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.ticker == "NVDA"
+    assert alert.source_ticker == "AMD"
+    assert alert.edge_id == "edge-AMD-NVDA-customer"
+    assert alert.edge_type == "customer"
+    assert alert.times_asserted == 4
+    assert alert.predicted_car == 0.04
+    assert "active customer edge from AMD" in alert.basis
+
+
 def test_event_through_a_non_active_cell_does_not_fire(tmp_config: Config) -> None:
     _seed_status(tmp_config, subtype="P", horizon=20, status=LadderStatus.CANDIDATE.value)
     _seed_event(tmp_config, ticker="AMD", subtype="P", available=datetime(2026, 7, 22, tzinfo=UTC))
@@ -288,6 +362,94 @@ def test_the_run_diffs_this_runs_transitions(tmp_config: Config) -> None:
 
     assert briefing.run_status == RunStatus.SUCCESS
     assert [c.kind for c in briefing.changes] == [ChangeKind.ACTIVATED]
+
+
+# --------------------------------------------------------------------------- #
+# DuckDB single-writer contention: graph-watchdog's extraction pass can hold #
+# the lock across the 6am autopilot run (2026-07-28 incident)                #
+# --------------------------------------------------------------------------- #
+def test_snapshot_db_busy_retries_then_recovers(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ladder-snapshot connection is retried, not fatal, once the lock frees up."""
+    attempts: list[int] = []
+    real_snapshot_statuses = briefing_builder.snapshot_statuses
+
+    def flaky(con: Any) -> dict[briefing_builder.CellKey, str]:
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise duckdb.IOException("could not set lock on file")
+        return real_snapshot_statuses(con)
+
+    monkeypatch.setattr(briefing_builder, "snapshot_statuses", flaky)
+
+    sleep_calls: list[float] = []
+    briefing = orchestrator.run(
+        tmp_config, as_of=AS_OF, steps=[ok_step("a")], sleep=sleep_calls.append
+    )
+
+    assert briefing.run_status == RunStatus.SUCCESS
+    assert len(attempts) == 3
+    assert sleep_calls == [45.0, 45.0]
+
+
+def test_snapshot_db_busy_exhausts_retries_and_fails_without_raising(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lock that never frees degrades to a FAILED briefing, never an unhandled raise."""
+    attempts: list[int] = []
+
+    def always_busy(_con: Any) -> dict[briefing_builder.CellKey, str]:
+        attempts.append(1)
+        raise duckdb.IOException("could not set lock on file")
+
+    monkeypatch.setattr(briefing_builder, "snapshot_statuses", always_busy)
+
+    sent: dict[str, Any] = {}
+
+    def fake_send(_config: Config, briefing: Any) -> bool:
+        sent["briefing"] = briefing
+        return True
+
+    monkeypatch.setattr(notify, "send", fake_send)
+
+    sleep_calls: list[float] = []
+    briefing = orchestrator.run(
+        tmp_config, as_of=AS_OF, steps=[ok_step("a")], sleep=sleep_calls.append
+    )
+
+    assert briefing.run_status == RunStatus.FAILED
+    assert any("database busy after retries" in n for n in briefing.notes)
+    assert len(attempts) == 20
+    assert len(sleep_calls) == 19
+    assert set(sleep_calls) == {45.0}
+    # The failure still reached Telegram -- silence must never look like success.
+    assert sent["briefing"] is briefing
+
+
+def test_gate_db_busy_retries_then_recovers(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate/build connection is retried too, not just the earlier snapshot."""
+    attempts: list[int] = []
+    real_build = briefing_builder.build
+
+    def flaky(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(1)
+        if len(attempts) < 2:
+            raise duckdb.IOException("could not set lock on file")
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(briefing_builder, "build", flaky)
+
+    sleep_calls: list[float] = []
+    briefing = orchestrator.run(
+        tmp_config, as_of=AS_OF, steps=[ok_step("a")], sleep=sleep_calls.append
+    )
+
+    assert briefing.run_status == RunStatus.SUCCESS
+    assert len(attempts) == 2
+    assert sleep_calls == [45.0]
 
 
 # --------------------------------------------------------------------------- #

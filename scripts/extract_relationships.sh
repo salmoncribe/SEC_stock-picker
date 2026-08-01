@@ -4,7 +4,8 @@
 # One pass processes every candidate section; the collector is resumable
 # (skip-extracted) and flushes per batch, so the supervisor's only job is to
 # ensure ollama is up and restart the run if the model or network drops it.
-# Ends when no candidate sections remain.
+# Ends when no candidate sections remain. Failed model calls are marked and
+# skipped; use RELATIONSHIP_RETRY_FAILED=1 to retry them deliberately.
 #
 # Usage: scripts/extract_relationships.sh [max_passes]
 set -u
@@ -91,6 +92,9 @@ for pass in $(seq 1 "$MAX_PASSES"); do
   fi
 
   cmd=(uv run market-intelligence signals extract-relationships --items 1 --latest-only)
+  if [ "${RELATIONSHIP_RETRY_FAILED:-0}" = "1" ]; then
+    cmd+=(--retry-failed)
+  fi
   if [ -n "$BATCH_LIMIT" ]; then
     cmd+=(--limit "$BATCH_LIMIT")
   fi

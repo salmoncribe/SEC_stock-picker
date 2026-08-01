@@ -429,3 +429,30 @@ class TestOrchestratorWiring:
         assert "grade-trade-alerts" in names
         assert "compute-returns" in names
         assert names.index("grade-trade-alerts") > names.index("compute-returns")
+
+    @pytest.mark.skip(
+        reason=(
+            "build-propagation pulled from default_steps 2026-07-29: an N+1 query "
+            "hung the daily run for 3h40m, and the fix uncovered a duplicate-key "
+            "collision on insert. Re-enable this test alongside the step once both "
+            "are fixed; see orchestrator.default_steps."
+        )
+    )
+    def test_propagation_samples_build_before_evaluate(self) -> None:
+        names = [step.name for step in orchestrator.default_steps()]
+
+        assert "build-propagation" in names
+        assert names.index("build-dataset") < names.index("build-propagation")
+        assert names.index("build-propagation") < names.index("evaluate")
+
+    def test_calibrate_gap_confidence_runs_right_after_grading_and_before_filing_events(
+        self,
+    ) -> None:
+        """Calibration needs today's freshly-graded outcomes (grade-trade-alerts)
+        and must land before anything else so a same-run price_gap alert can see
+        it -- see gap_calibration.py's module docstring."""
+        names = [step.name for step in orchestrator.default_steps()]
+
+        assert "calibrate-gap-confidence" in names
+        assert names.index("grade-trade-alerts") < names.index("calibrate-gap-confidence")
+        assert names.index("calibrate-gap-confidence") < names.index("sync-filing-events")

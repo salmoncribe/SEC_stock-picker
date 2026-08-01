@@ -108,6 +108,33 @@ class TestBuildRecords:
         assert payload["hit_rate"] == 0.65
         assert payload["n_clusters"] == 40
 
+    def test_propagation_edge_alert_uses_edge_identity_and_evidence(
+        self, memory_db: duckdb.DuckDBPyConnection, tmp_config: Config
+    ) -> None:
+        _seed_prices(memory_db, "NVDA")
+        alert = _alert(
+            ticker="NVDA",
+            source_ticker="AMD",
+            edge_id="edge-AMD-NVDA-customer",
+            edge_type="customer",
+            times_asserted=4,
+            edge_extraction_confidence=0.8,
+            basis="active customer edge from AMD, holdout hit 65.0%, asserted 4x",
+        )
+
+        records, notes = trade_alerts.build_records(memory_db, [alert], tmp_config, AS_OF)
+
+        assert notes == []
+        assert len(records) == 1
+        record = records[0]
+        assert record.ticker == "NVDA"
+        assert record.trigger_key == "ev1:edge-AMD-NVDA-customer:20"
+        assert record.edge_id == "edge-AMD-NVDA-customer"
+        assert record.evidence["source_ticker"] == "AMD"
+        assert record.evidence["target_ticker"] == "NVDA"
+        assert record.evidence["edge_type"] == "customer"
+        assert record.evidence["times_asserted"] == 4
+
     def test_ticker_with_no_price_history_is_skipped_with_note(
         self, memory_db: duckdb.DuckDBPyConnection, tmp_config: Config
     ) -> None:

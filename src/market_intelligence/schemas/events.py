@@ -45,6 +45,13 @@ class EventType:
 
     INSIDER_TRANSACTION = "insider_transaction"
     FILING_ITEM = "filing_item"
+    #: A cluster of open-market purchases (code P) by several distinct
+    #: insiders at one company within a short window -- see
+    #: ``analytics/cluster_buy.py``. One event per (company, window), never
+    #: one per underlying transaction, so it carries the clustered-statistics
+    #: discipline in its own natural key rather than relying on the gate to
+    #: fix it after the fact.
+    INSIDER_CLUSTER_BUY = "insider_cluster_buy"
 
 
 class InsiderTransactionCode:

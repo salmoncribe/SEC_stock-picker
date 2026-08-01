@@ -39,8 +39,20 @@ logger = get_logger(__name__)
 # should only ever have one live copy running at once. A second copy matching
 # the same marker is fighting the first for the DuckDB lock or the ollama port,
 # never doing additional useful work.
+#
+# Order matters: ``_duplicate_groups`` files a process under the FIRST marker
+# it matches, so the specific portfolio markers precede the generic
+# ``market_intelligence`` ones. Without them a `portfolio replay` (minutes of
+# numpy over a 2,500-day panel) and an unrelated collector would land in the
+# same "duplicate" bucket and the guard would stop one of two processes that
+# were never duplicates of each other. With them, only a second replay counts
+# as a duplicate of the first -- and the first, being longer-running, is the
+# one kept.
 SINGLETON_MARKERS: tuple[str, ...] = (
     "ollama serve",
+    "portfolio replay",
+    "portfolio sweep",
+    "portfolio step",
     "market_intelligence",
     "market-intelligence",
     "backfill_documents.sh",
@@ -50,6 +62,9 @@ SINGLETON_MARKERS: tuple[str, ...] = (
 # Markers whose duplicates might be mid-write to the database, so a duplicate
 # among them is only killed once it's confirmed not to hold the DuckDB lock.
 _DB_TOUCHING_MARKERS = (
+    "portfolio replay",
+    "portfolio sweep",
+    "portfolio step",
     "market_intelligence",
     "market-intelligence",
     "backfill_documents.sh",

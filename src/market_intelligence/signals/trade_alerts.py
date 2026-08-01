@@ -93,6 +93,18 @@ def _load_bars(
     return bars, invalid
 
 
+def _combined_extraction_confidence(alert: EventAlert) -> float | None:
+    """Conservative confidence for alerts that depend on both event and edge extraction."""
+    values = [
+        value
+        for value in (alert.extraction_confidence, alert.edge_extraction_confidence)
+        if value is not None
+    ]
+    if not values:
+        return None
+    return min(values)
+
+
 def build_records(
     con: duckdb.DuckDBPyConnection,
     alerts: Sequence[EventAlert],
@@ -145,34 +157,41 @@ def build_records(
                 ConfidenceInputs(
                     hit_rate=alert.hit_rate,
                     n_clusters=alert.n_clusters,
-                    times_asserted=0,
-                    extraction_confidence=alert.extraction_confidence,
+                    times_asserted=alert.times_asserted,
+                    extraction_confidence=_combined_extraction_confidence(alert),
                     has_track_record=True,
                 )
             )
             evidence = {
                 "event_type": alert.event_type,
                 "event_subtype": alert.event_subtype,
-                "available_on": alert.available_on.isoformat(),
                 "basis": alert.basis,
+                "available_on": alert.available_on.isoformat(),
                 "hit_rate": alert.hit_rate,
                 "n_clusters": alert.n_clusters,
                 "predicted_car": alert.predicted_car,
                 "extraction_confidence": alert.extraction_confidence,
+                "edge_id": alert.edge_id,
+                "edge_type": alert.edge_type,
+                "source_ticker": alert.source_ticker,
+                "target_ticker": alert.ticker,
+                "times_asserted": alert.times_asserted,
+                "edge_extraction_confidence": alert.edge_extraction_confidence,
             }
+            edge_id = alert.edge_id or "self"
             records.append(
                 TradeAlertRecord(
                     alert_id=uuid4().hex,
                     kind="reaction_lag",
                     ticker=alert.ticker,
-                    trigger_key=f"{alert.event_id or 'unknown'}:self:{alert.horizon_days}",
+                    trigger_key=f"{alert.event_id or 'unknown'}:{edge_id}:{alert.horizon_days}",
                     fired_at=utcnow(),
                     direction=alert.direction,
                     plan=plan,
                     confidence=confidence,
                     evidence=evidence,
                     event_id=alert.event_id or None,
-                    edge_id="self",
+                    edge_id=edge_id,
                 )
             )
         except Exception as exc:  # one bad ticker must not sink the rest

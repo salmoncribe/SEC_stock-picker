@@ -12,11 +12,11 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -164,6 +164,218 @@ class GapScannerConfig(BaseModel):
     min_confidence: int = Field(default=40, ge=0, le=100)
 
 
+class PeopleGraphConfig(BaseModel):
+    """Tuning for the people/insider graph (see docs/specs/2026-07-25-people-
+    insider-graph-design.md, §5 "Data quality notes specific to people").
+
+    ``interlock_max_companies_per_person`` caps how many ``role_memberships``
+    a single director may contribute interlock edges from before being
+    treated as a professional board-sitter / mutual-fund trustee and skipped
+    entirely -- without this cap a handful of serial board members would
+    flood the graph with a fully-connected, low-information hub.
+
+    ``cluster_buy_window_days`` / ``cluster_buy_min_insiders`` define what
+    counts as a cluster: open-market purchases (Form 4 code ``P``) by at
+    least this many distinct insiders at the same company within this many
+    days of each other. First-cut defaults, meant to be tuned against the
+    discovery split like every other threshold in this platform, not chosen
+    by inspection.
+    """
+
+    interlock_max_companies_per_person: int = Field(default=15, ge=2)
+    cluster_buy_window_days: int = Field(default=5, ge=1)
+    cluster_buy_min_insiders: int = Field(default=2, ge=2)
+
+
+class RelationshipDecisionConfig(BaseModel):
+    """Fail-closed policy for the SEC relationship decision workflow.
+
+    This is deliberately a research policy, not trading configuration.  A
+    configured live-quality first-public source, market source, and broker
+    source are each required before a decision can become notify-eligible.
+    Keeping that fact in the config model makes an omitted provider an explicit
+    suppression rather than an implicit assumption.
+    """
+
+    enabled: bool = False
+    strategy_version: str = "relationship-decision-v1"
+    evidence_score_threshold: int = Field(default=8, ge=0)
+    minimum_independent_clusters: int = Field(default=30, ge=1)
+    net_target_pct: float = Field(default=2.0, gt=0.0)
+    min_reward_to_risk: float = Field(default=2.0, gt=0.0)
+    max_quote_age_seconds: float = Field(default=5.0, gt=0.0)
+    max_spread_bps: float = Field(default=50.0, gt=0.0)
+    max_participation_pct: float = Field(default=10.0, gt=0.0, le=100.0)
+    regular_hours_only: bool = True
+    # Provider ids remain null until the operator has selected and configured
+    # an audited source. Null means research-only; it never means "use daily
+    # yfinance as a live substitute".
+    first_public_source: str | None = None
+    realtime_market_source: str | None = None
+    broker_read_only_source: str | None = None
+    short_candidates_enabled: bool = False
+    kill_switch_enabled: bool = True
+
+
+class PortfolioConfig(BaseModel):
+    """Account-level portfolio construction for the paper-trading simulator.
+
+    Distinct from ``TradingConfig`` on purpose. ``TradingConfig`` sizes one
+    rendered alert against Michael's real account; this configures a *simulated*
+    account that the brain reasons about as a whole -- covariance, views,
+    optimizer, risk budget. Nothing here reaches a brokerage: the simulator
+    proposes, it never executes (repo design decision G).
+
+    Geometry note: the validated backtest geometry (8x ATR disaster-brake stops,
+    sizing decoupled from stop width, horizon exits in trading days) lives in
+    the simulator, not here, and deliberately diverges from the live
+    ``trading.atr_stop_multiple`` of 2.0 that the alert path still ships. That
+    divergence is documented, not silently reconciled -- changing the live value
+    is Michael's call, not a side effect of building the simulator.
+
+    ``graph_return_views_enabled`` ships False and stays False until a
+    propagation cell actually passes the measurement gate (ADMITTED via
+    impact.judge, then the beta-hedged >=15bps tradeability screen). No
+    propagation coefficient has ever been measured; an empty gate is a
+    legitimate outcome that the report states plainly rather than papering over.
+
+    ``hwm_decay_halflife_days`` is the half-life of the *gap* between the
+    account's high-water mark and its current equity, and it exists because a
+    governor with an exit rule and no re-entry rule is an absorbing state. The
+    replay measured that: equity peaked at $15,942 on 2020-02-14, fell to
+    $12,917 by 2020-03-12 (18.97%), and the governor flattened to cash -- after
+    which equity moved on 0 of the next 1,603 sessions and the governor returned
+    gross on 0 of 1,604, because a flat account cannot make the new high the
+    ratcheting mark needed. 63 sessions is one quarter: long enough that a real
+    crash is still respected for months, short enough that six years of forgone
+    recovery cannot happen again. Setting it very large restores the old
+    absorbing behavior; there is deliberately no way to switch it off.
+
+    ``vol_estimate_lambda`` is the decay of the covariance the *volatility
+    scaler* reads, and it is deliberately separate from ``ewma_lambda`` because
+    the two estimates have different jobs. The optimizer wants a stable
+    covariance -- a jumpy one churns the book, and turnover already exceeds its
+    cap -- so it keeps the ``lw_blend`` mixture. The scaler wants a fast one.
+    Sharing one estimate between them measured as a risk control that does not
+    act: over the 2,518-session replay ``vol_scale`` bound on 37 days (1.5%) and
+    returned exactly 1.000 through the entire COVID crash, including 2020-03-12
+    when SPY's realized volatility was ~50%/yr against the 12% target. The
+    blended estimate was not wrong, it was too slow to turn: in late February
+    2020 its trailing year was eleven months of calm.
+
+    0.94 is the RiskMetrics (1996) short-horizon standard -- a published
+    constant with a ~11-session half-life, chosen *before* looking at what it
+    does to any particular window. **It must not be tuned against the COVID
+    window.** We already know COVID happened, so a value fitted to it is fitted
+    to one event, and the resulting backtest would be measuring hindsight
+    rather than a risk control. Change it only for a reason that would have
+    been sayable in 1996.
+
+    ``bl_engine`` selects the Black-Litterman implementation. Verified
+    2026-07-31 on pandas 3.0.3 / numpy 2.5.1 / Python 3.14.6: PyPortfolioOpt's
+    posterior agrees with the hand-rolled closed form to 1.4e-17, so pypfopt is
+    the default and "numpy" is a tested substitute rather than a fallback we
+    expect to need. pypfopt never sits in the optimizer solve path either way.
+    """
+
+    # -- account ---------------------------------------------------------- #
+    starting_cash: float = Field(default=10_000.0, gt=0.0)
+    fractional_shares: bool = True
+    long_only: bool = True
+    simulation_version: str = "portfolio-sim-v1"
+
+    # -- risk limits ------------------------------------------------------ #
+    max_position: float = Field(default=0.15, gt=0.0, le=1.0)
+    max_cluster: float = Field(default=0.30, gt=0.0, le=1.0)
+    max_gross: float = Field(default=1.0, gt=0.0, le=1.0)
+    target_vol: float = Field(default=0.12, gt=0.0)
+    max_single_name_risk_share: float = Field(default=0.35, gt=0.0, le=1.0)
+
+    # -- drawdown governor (Michael's moderate risk budget) --------------- #
+    # Halve gross at -10%, flatten at -15%. ``governor_bypasses_band`` is a
+    # decision, not a tuning knob: when the governor de-risks, the no-trade
+    # band must not suppress the resulting sells, or the account stays more
+    # exposed than the governor intended precisely during a drawdown. The band
+    # continues to suppress ordinary rebalance churn.
+    governor_halve_drawdown: float = Field(default=0.10, gt=0.0, lt=1.0)
+    governor_halve_scale: float = Field(default=0.5, ge=0.0, le=1.0)
+    governor_flatten_drawdown: float = Field(default=0.15, gt=0.0, lt=1.0)
+    governor_bypasses_band: bool = True
+    hwm_decay_halflife_days: int = Field(default=63, ge=1)
+
+    # -- covariance ------------------------------------------------------- #
+    # ``ewma_lambda`` / ``lw_blend`` build the *optimizer's* covariance;
+    # ``vol_estimate_lambda`` is the volatility scaler's own, faster one. See
+    # the class docstring for why they are two numbers and not one.
+    cov_lookback: int = Field(default=252, ge=20)
+    ewma_lambda: float = Field(default=0.97, gt=0.0, lt=1.0)
+    lw_blend: float = Field(default=0.5, ge=0.0, le=1.0)
+    vol_estimate_lambda: float = Field(default=0.94, gt=0.0, lt=1.0)
+
+    # -- views / Black-Litterman ------------------------------------------ #
+    tau: float = Field(default=0.05, gt=0.0)
+    bl_engine: Literal["pypfopt", "numpy"] = "pypfopt"
+    graph_return_views_enabled: bool = False
+
+    # -- optimizer -------------------------------------------------------- #
+    objective: Literal["max_sharpe", "min_cvar"] = "max_sharpe"
+    risk_aversion: float = Field(default=2.5, gt=0.0)
+    turnover_penalty_bps: float = Field(default=25.0, ge=0.0)
+    no_trade_band: float = Field(default=0.01, ge=0.0)
+    rebalance_days: int = Field(default=5, ge=1)
+    #: **Declared, reported against, and enforced by nothing.** No code reads
+    #: this field; the replay reports ``turnover_annual`` and no constraint,
+    #: penalty or veto anywhere consults the number. Read it as a preregistered
+    #: criterion, not as a limit the simulator can hold.
+    #:
+    #: It is also unreachable as written, and the arithmetic is short. Turnover
+    #: on ``cli._turnover_series``' definition is roughly
+    #: ``2 * gross * 252 / holding_days``: every position is bought once and
+    #: sold once, and it is held for its signal's horizon. The admitted cells
+    #: are 20-session, and the ten-year replay ran at 0.74 mean gross, so
+    #: ``2 * 0.74 * 252/20 = 18.6``x/yr of round trips before anything damps
+    #: them -- the replay measured 14.0x. Reaching 4.0x needs either a
+    #: ~70-session average hold (holding a position long past the window its
+    #: edge was measured over) or ~20% gross. Cutting gross does not help on
+    #: net: alpha and cost both scale with exposure, so a 3.5x cut takes
+    #: 2.12%/yr of gross alpha and 0.62%/yr of slippage down together and
+    #: leaves 0.43%/yr net where there was 1.50%/yr. Measured on the replay's
+    #: own price history: gross 0.75 -> 0.48 -> 0.25 gave turnover
+    #: 12.4x -> 8.0x -> 4.8x and Sharpe 0.74 -> 0.63 -> 0.40.
+    #:
+    #: Note also that this definition counts BOTH sides of a round trip, which
+    #: is twice the SEC N-1A convention. That halves the reported figure but
+    #: does not rescue the criterion, and the metric is not being redefined to
+    #: pass it.
+    max_turnover_annual: float = Field(default=4.0, gt=0.0)
+    cvar_alpha: float = Field(default=0.95, gt=0.0, lt=1.0)
+
+    # -- costs (5bps default = parity with analytics/backtest.py) --------- #
+    slippage_bps: float = Field(default=5.0, ge=0.0)
+    commission_per_share: float = Field(default=0.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def _check_governor_ladder(self) -> PortfolioConfig:
+        """Flatten must sit strictly below halve, or the ladder is unreachable."""
+        if self.governor_flatten_drawdown <= self.governor_halve_drawdown:
+            raise ValueError(
+                "governor_flatten_drawdown must exceed governor_halve_drawdown "
+                f"(got flatten={self.governor_flatten_drawdown}, "
+                f"halve={self.governor_halve_drawdown})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_position_cluster_ladder(self) -> PortfolioConfig:
+        """A cluster cap below the position cap would never bind."""
+        if self.max_cluster < self.max_position:
+            raise ValueError(
+                "max_cluster must be >= max_position "
+                f"(got cluster={self.max_cluster}, position={self.max_position})"
+            )
+        return self
+
+
 class SettingsFile(BaseModel):
     app: AppInfo = AppInfo()
     http: HttpConfig = HttpConfig()
@@ -173,6 +385,9 @@ class SettingsFile(BaseModel):
     llm: LLMConfig = LLMConfig()
     trading: TradingConfig = TradingConfig()
     gap_scanner: GapScannerConfig = GapScannerConfig()
+    people_graph: PeopleGraphConfig = PeopleGraphConfig()
+    relationship_decision: RelationshipDecisionConfig = RelationshipDecisionConfig()
+    portfolio: PortfolioConfig = PortfolioConfig()
     sec: SecConfig
     fred: FredConfig
 
@@ -307,6 +522,29 @@ class Config:
             )
         return key
 
+    def relationship_decision_readiness(self) -> tuple[bool, tuple[str, ...]]:
+        """Return whether a candidate workflow may leave research-only mode.
+
+        This intentionally does not declare an edge proven or send anything.
+        It only makes missing operator decisions observable as stable reasons,
+        rather than allowing daily prices or EDGAR acceptance time to stand in
+        for live-quality market/first-public/borrow evidence.
+        """
+        policy = self.settings.relationship_decision
+        reasons: list[str] = []
+        if not policy.enabled:
+            reasons.append("relationship_decision_disabled")
+        if not policy.first_public_source:
+            reasons.append("first_public_source_unconfigured")
+        if not policy.realtime_market_source:
+            reasons.append("realtime_market_source_unconfigured")
+        if not policy.broker_read_only_source:
+            reasons.append("broker_read_only_source_unconfigured")
+        # Contracts alone are not a selected, audited live adapter or a
+        # completed shadow-period review. Keep candidate notification closed.
+        reasons.append("live_candidate_mode_not_implemented")
+        return not reasons, tuple(reasons)
+
     def fingerprint(self) -> dict[str, Any]:
         """Config subset that meaningfully affects collection output.
 
@@ -320,6 +558,7 @@ class Config:
             "pacing": self.settings.pacing.model_dump(),
             "retry": self.settings.retry.model_dump(),
             "http": self.settings.http.model_dump(),
+            "relationship_decision": self.settings.relationship_decision.model_dump(),
             "series": [s.model_dump() for s in self.fred_series.series],
             "fred_defaults": self.fred_series.defaults.model_dump(),
             "companies": [c.model_dump() for c in self.companies.companies],

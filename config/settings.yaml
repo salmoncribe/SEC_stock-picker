@@ -70,3 +70,91 @@ gap_scanner:
   # gap alerts carry no track record yet and cap at confidence 50; this floor
   # lets them text anyway — raise to 60+ to silence them until the ledger matures
   min_confidence: 40
+
+# People/insider graph (docs/specs/2026-07-25-people-insider-graph-design.md).
+people_graph:
+  # Persons with more role_memberships than this are treated as professional
+  # board-sitters / mutual-fund trustees and skipped when projecting
+  # shared_board_member interlock edges, so they cannot flood the graph with
+  # a fully-connected, low-information hub.
+  interlock_max_companies_per_person: 15
+  # A cluster-buy window: distinct insiders buying (Form 4 code P) at the same
+  # company within this many days of each other.
+  cluster_buy_window_days: 5
+  cluster_buy_min_insiders: 2
+
+# SEC relationship decisions are research-only by default. Do not add provider
+# names here until their first-public, NBBO/replay, and read-only broker/borrow
+# capabilities have been independently validated.
+relationship_decision:
+  enabled: false
+  strategy_version: "relationship-decision-v1"
+  evidence_score_threshold: 8
+  minimum_independent_clusters: 30
+  net_target_pct: 2.0
+  min_reward_to_risk: 2.0
+  max_quote_age_seconds: 5.0
+  max_spread_bps: 50.0
+  max_participation_pct: 10.0
+  regular_hours_only: true
+  first_public_source: null
+  realtime_market_source: null
+  broker_read_only_source: null
+  short_candidates_enabled: false
+  kill_switch_enabled: true
+
+# Paper-trading portfolio brain. Simulation only -- never reaches a brokerage.
+# Every field is defaulted in config.PortfolioConfig; this block exists so the
+# knobs are visible and tunable without reading Python.
+portfolio:
+  starting_cash: 10000.0
+  fractional_shares: true
+  long_only: true
+  simulation_version: "portfolio-sim-v1"
+  # Risk budget (Michael, 2026-07-31): ~12% vol target, halve gross at -10%
+  # drawdown, flatten at -15%. The governor bypasses the no-trade band so
+  # de-risking always executes in full.
+  max_position: 0.15
+  max_cluster: 0.30
+  max_gross: 1.0
+  target_vol: 0.12
+  governor_halve_drawdown: 0.10
+  governor_halve_scale: 0.5
+  governor_flatten_drawdown: 0.15
+  governor_bypasses_band: true
+  # Half-life of the gap between the high-water mark and current equity, so a
+  # flattened account can heal a drawdown it is forbidden to trade out of. The
+  # replay without it: flattened 2020-03-12 at -18.97%, then 0 of the next 1,603
+  # sessions moved -- a flat account cannot make a new high, so the ratcheting
+  # mark pinned the drawdown there for 6.4 years. 63 sessions = one quarter.
+  hwm_decay_halflife_days: 63
+  # Covariance: Ledoit-Wolf shrunk sample blended 50/50 with EWMA.
+  cov_lookback: 252
+  ewma_lambda: 0.97
+  lw_blend: 0.5
+  # The volatility scaler reads its own faster EWMA (RiskMetrics 1996 lambda,
+  # ~11-session half-life). Sharing the blend above left vol_scale bound on 37
+  # of 2,518 sessions (1.5%) and at exactly 1.000 through all of COVID. Do not
+  # tune this against that window.
+  vol_estimate_lambda: 0.94
+  # Views. graph_return_views_enabled stays false until a propagation cell
+  # actually passes the measurement gate -- no hand-waived coefficients.
+  tau: 0.05
+  bl_engine: "pypfopt"
+  graph_return_views_enabled: false
+  # Optimizer. 25bps turnover penalty, 1% no-trade band, weekly rebalance.
+  objective: "max_sharpe"
+  risk_aversion: 2.5
+  turnover_penalty_bps: 25.0
+  no_trade_band: 0.01
+  rebalance_days: 5
+  # Preregistered criterion, NOT a limit: no code reads this field, so nothing
+  # enforces it. It is also unreachable as written -- turnover is roughly
+  # 2 * gross * 252 / holding_days, and a 20-session edge at 0.74 gross is
+  # ~18.6x/yr of round trips before any damping (the replay measured 14.0x).
+  # Getting to 4.0x needs ~20% gross, which scales alpha down with the cost and
+  # leaves less net edge, not more. See PortfolioConfig.max_turnover_annual.
+  max_turnover_annual: 4.0
+  # 5bps slippage = parity with analytics/backtest.py, not an independent guess.
+  slippage_bps: 5.0
+  commission_per_share: 0.0

@@ -29,11 +29,13 @@ returned -- not even as the reason an otherwise-unique name is called ambiguous.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 
 import duckdb
 
+from market_intelligence import hashing
 from market_intelligence.schemas.edges import ResolutionStatus
 
 #: Confidence attached to a unique exact normalized match -- the only case we
@@ -267,8 +269,147 @@ class CompanyIndex:
         return _unresolved()
 
 
+# --------------------------------------------------------------------------- #
+# People (docs/specs/2026-07-25-people-insider-graph-design.md, Decision A)     #
+# --------------------------------------------------------------------------- #
+#: Intra-word marks / separators reused from the company normalizer -- person
+#: names carry the same casing/punctuation noise, just none of the legal-form
+#: suffixes, so the suffix-stripping half of that pipeline does not apply here.
+def normalize_person_name(name: str) -> str:
+    """Reduce a person's name to a bare, comparable token string.
+
+    Unlike :func:`normalize_company_name`, this strips no trailing "suffix"
+    tokens -- a person's name has no legal form to strip, and guessing that a
+    trailing word is noise (rather than, say, a real surname) is exactly the
+    kind of invented rule this module avoids. Only case, punctuation, and
+    whitespace are normalized, so "Doe, Jane" and "DOE, JANE" agree but
+    "Doe, Jane" and "Jane Doe" deliberately do not -- SEC's own filer-name
+    field orders names inconsistently across filings, and folding both orders
+    together risks merging two different real people who happen to share a
+    surname and a given name in swapped fields.
+    """
+    dropped = _DROP_RE.sub("", name.upper())
+    tokens = _SEP_RE.sub(" ", dropped).split()
+    return " ".join(tokens)
+
+
+def person_id_for_cik(reporting_owner_cik: str) -> str:
+    """Derive the stable ``person_id`` for a normalized SEC reporting-owner CIK.
+
+    Pure and deterministic, so any producer that already knows a CIK --
+    ``collectors/roles.py``, ``analytics/cluster_buy.py`` -- computes the same
+    id without a database round trip, and both always agree on identity. This
+    is the one function that owns that derivation; nothing else should hash a
+    person id independently.
+    """
+    return hashing.content_hash("person", reporting_owner_cik)
+
+
+@dataclass(frozen=True)
+class PersonResolution:
+    """The verdict for one person lookup -- mirrors :class:`Resolution`.
+
+    ``status`` is a :class:`ResolutionStatus` value. ``person_id`` /
+    ``reporting_owner_cik`` / ``canonical_name`` are set only on ``RESOLVED``.
+    """
+
+    status: str
+    person_id: str | None
+    reporting_owner_cik: str | None
+    canonical_name: str | None
+
+
+def _person_unresolved() -> PersonResolution:
+    return PersonResolution(ResolutionStatus.UNRESOLVED.value, None, None, None)
+
+
+def _person_ambiguous() -> PersonResolution:
+    return PersonResolution(ResolutionStatus.AMBIGUOUS.value, None, None, None)
+
+
+class PersonIndex:
+    """Normalized lookup over the ``people`` table, built once and reused.
+
+    Identity is keyed on ``reporting_owner_cik`` (Decision A) -- a persistent
+    SEC identifier already present on every Form 3/4/5 row this platform
+    stores, so :meth:`resolve_cik` is an exact lookup with no ambiguity
+    possible: two different people never share a CIK. :meth:`resolve_name`
+    exists for the one case a CIK cannot cover -- a name observed with no CIK
+    attached (the deferred Phase 4 8-K executive-change case) -- and mirrors
+    :class:`CompanyIndex`'s conservatism: a normalized name shared by more
+    than one known person is ``AMBIGUOUS`` and resolves to nothing, never a
+    guess, because inventing a match invents a person's involvement in a
+    company they may have nothing to do with.
+    """
+
+    def __init__(
+        self, people: list[tuple[str, str, str | None, list[str]]]
+    ) -> None:
+        """Build from ``(person_id, reporting_owner_cik, canonical_name, name_variants)`` rows."""
+        self._by_cik: dict[str, tuple[str, str | None]] = {}
+        self._by_name: dict[str, list[tuple[str, str]]] = {}
+
+        for person_id, cik, canonical_name, variants in people:
+            self._by_cik[cik] = (person_id, canonical_name)
+            names = {n for n in (canonical_name, *variants) if n}
+            for name in names:
+                normalized = normalize_person_name(name)
+                if not normalized:
+                    continue
+                self._by_name.setdefault(normalized, []).append((person_id, cik))
+
+    @classmethod
+    def from_connection(cls, con: duckdb.DuckDBPyConnection) -> PersonIndex:
+        """Build the index from the ``people`` table -- a thin read only."""
+        rows = con.execute(
+            "SELECT person_id, reporting_owner_cik, canonical_name, name_variants FROM people"
+        ).fetchall()
+        people: list[tuple[str, str, str | None, list[str]]] = []
+        for person_id, cik, canonical_name, variants_json in rows:
+            variants = json.loads(variants_json) if variants_json else []
+            people.append((str(person_id), str(cik), canonical_name, list(variants)))
+        return cls(people)
+
+    def resolve_cik(self, reporting_owner_cik: str) -> PersonResolution:
+        """Exact lookup by the persistent SEC identity key. Never ambiguous."""
+        hit = self._by_cik.get(reporting_owner_cik)
+        if hit is None:
+            return _person_unresolved()
+        person_id, canonical_name = hit
+        return PersonResolution(
+            ResolutionStatus.RESOLVED.value, person_id, reporting_owner_cik, canonical_name
+        )
+
+    def resolve_name(self, name: str) -> PersonResolution:
+        """Resolve a bare name, refusing rather than guessing.
+
+        Exact normalized match on a single known person -> ``RESOLVED``; the
+        same normalized name shared by more than one distinct CIK ->
+        ``AMBIGUOUS``. No subset/token fallback -- unlike a company name, a
+        person's name has no distinguishing legal-suffix noise to explain away
+        a partial match, so anything short of an exact hit is left
+        ``UNRESOLVED`` rather than risked.
+        """
+        normalized = normalize_person_name(name)
+        if not normalized:
+            return _person_unresolved()
+        candidates = self._by_name.get(normalized)
+        if not candidates:
+            return _person_unresolved()
+        distinct_ciks = {cik for _, cik in candidates}
+        if len(distinct_ciks) > 1:
+            return _person_ambiguous()
+        person_id, cik = candidates[0]
+        canonical_name = self._by_cik.get(cik, (None, None))[1]
+        return PersonResolution(ResolutionStatus.RESOLVED.value, person_id, cik, canonical_name)
+
+
 __all__ = [
     "CompanyIndex",
+    "PersonIndex",
+    "PersonResolution",
     "Resolution",
     "normalize_company_name",
+    "normalize_person_name",
+    "person_id_for_cik",
 ]

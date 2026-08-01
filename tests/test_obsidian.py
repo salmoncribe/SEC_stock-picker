@@ -126,6 +126,23 @@ def test_bearish_alert_uses_direction_for_its_sign() -> None:
     assert "predicted -3.10% over 20d" in note
 
 
+def test_propagation_alert_names_source_and_edge_type() -> None:
+    note = obsidian.render_note(
+        _briefing(
+            alerts=[
+                _alert(
+                    ticker="NVDA",
+                    source_ticker="AMD",
+                    edge_type="customer",
+                    basis="active customer edge from AMD, holdout hit 58.8%",
+                )
+            ]
+        )
+    )
+
+    assert "**NVDA** from AMD via customer" in note
+
+
 # --------------------------------------------------------------------------- #
 # activated cells lead                                                         #
 # --------------------------------------------------------------------------- #

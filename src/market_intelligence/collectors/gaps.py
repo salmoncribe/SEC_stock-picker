@@ -32,22 +32,31 @@ out of sync with the first. Note that ``as_of`` only ever controls which
 prior-day bars and events are read: the quote itself is always a live call,
 so ``scan(as_of=<a past date>)`` is not a true historical replay.
 
-**Confidence is deliberately capped.** ``ConfidenceInputs.has_track_record``
-is always ``False`` here, which caps the blended score at 50 regardless of
-gap size or liquidity -- this scanner has no graded outcomes yet to earn a
-higher number from. Spec Sec.5 sketches gap-specific substitute inputs (gap
-size, liquidity) for the score; those are deliberately *not* implemented as
-separate blend terms. Until :mod:`market_intelligence.signals.grading`
-accumulates real hit/miss history for ``kind="price_gap"`` rows, the only
-input this path adds beyond the no-track-record cap is
-``times_asserted=1 if catalyst else 0`` -- a same-week filing/event on the
-ticker nudges the score up a little as corroboration, exactly the same
-mechanism the daily path uses for independently-asserted edges. The message
-still carries "no track record yet" in evidence so a human reading it never
-mistakes 50 for a real number. Because that 50-point cap sits *below*
-``trading.min_confidence`` (60 by default), gap alerts are gated against
-their own floor -- ``gap_scanner.min_confidence`` (40 by default) -- rather
-than the daily path's, or they would never clear the bar to text at all.
+**Confidence starts capped, then earns its way out per bucket.**
+``ConfidenceInputs.has_track_record`` was always ``False`` here until
+:mod:`market_intelligence.signals.gap_calibration` existed to accumulate real
+hit/miss history for ``kind="price_gap"`` rows. Now each candidate is looked
+up against its own ``(direction, gap size, catalyst present)`` bucket in
+``gap_calibration_stats`` (via ``gap_calibration.lookup_track_record``,
+using the same connection this write phase already has open): a bucket with
+at least one decisive graded outcome (``hit_target``/``hit_stop``) flips
+``has_track_record=True`` and passes that bucket's shrunk hit rate and
+sample size through; an empty or undecided bucket falls back to exactly
+today's original behaviour -- ``has_track_record=False``, capped at 50. Spec
+Sec.5 sketches gap-specific substitute inputs (gap size, liquidity) for the
+score directly; those are deliberately *not* implemented as separate blend
+terms -- the bucket lookup is the substitute. The only input this path adds
+beyond that is ``times_asserted=1 if catalyst else 0`` -- a same-week
+filing/event on the ticker nudges the score up a little as corroboration,
+exactly the same mechanism the daily path uses for independently-asserted
+edges. The evidence's ``note`` field says which case applied (no track
+record yet, vs. calibrated on n decisive outcomes) so a human reading it
+never mistakes a capped 50 for an earned one, or vice versa. Because the
+no-track-record cap sits *below* ``trading.min_confidence`` (60 by default),
+gap alerts are gated against their own floor -- ``gap_scanner.min_confidence``
+(40 by default) -- rather than the daily path's, or they would never clear
+the bar to text at all; a bucket that has earned a track record can, once
+its shrunk hit rate is high enough, clear even the daily path's floor.
 
 **Three phases, so the DuckDB lock is never held across network I/O.**
 DuckDB is single-writer, and a live quote fetch is comparatively slow and
@@ -106,6 +115,7 @@ from market_intelligence.clients.market_yfinance import YFinanceMarketDataProvid
 from market_intelligence.collectors import RunSummary, pipeline_run
 from market_intelligence.logging_config import get_logger
 from market_intelligence.schemas.common import utcnow
+from market_intelligence.signals import gap_calibration
 from market_intelligence.signals.confidence import ConfidenceInputs, score
 from market_intelligence.signals.trade_alerts import (
     TradeAlertRecord,
@@ -388,15 +398,35 @@ def _build_candidate(
         summary.bump("gap_scan_no_plan")
         return None
 
-    confidence = score(
-        ConfidenceInputs(
-            hit_rate=None,
-            n_clusters=0,
-            times_asserted=1 if catalyst else 0,
-            extraction_confidence=None,
-            has_track_record=False,
-        )
+    track_record = gap_calibration.lookup_track_record(
+        con, direction=direction, gap_pct=gap_pct, catalyst_present=catalyst is not None
     )
+    if track_record is None:
+        confidence = score(
+            ConfidenceInputs(
+                hit_rate=None,
+                n_clusters=0,
+                times_asserted=1 if catalyst else 0,
+                extraction_confidence=None,
+                has_track_record=False,
+            )
+        )
+        track_record_note = "no track record yet"
+    else:
+        bucket_hit_rate, bucket_n_decisive = track_record
+        confidence = score(
+            ConfidenceInputs(
+                hit_rate=bucket_hit_rate,
+                n_clusters=bucket_n_decisive,
+                times_asserted=1 if catalyst else 0,
+                extraction_confidence=None,
+                has_track_record=True,
+            )
+        )
+        track_record_note = (
+            f"calibrated on n={bucket_n_decisive} decisive outcomes "
+            f"(bucket hit rate {bucket_hit_rate:.0%})"
+        )
 
     evidence: dict[str, Any] = {
         "gap_pct": gap_pct,
@@ -404,7 +434,7 @@ def _build_candidate(
         "quote": quote.price,
         "avg_dollar_volume": survivor.avg_dollar_volume,
         "catalyst": catalyst if catalyst is not None else "no catalyst",
-        "note": "no track record yet",
+        "note": track_record_note,
     }
 
     return TradeAlertRecord(

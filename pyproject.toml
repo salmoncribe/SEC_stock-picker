@@ -25,6 +25,16 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "lxml>=5.2",
     "yfinance>=0.2.40",
+    # Portfolio construction. numpy was already present transitively (pandas,
+    # pyarrow); it is declared here because portfolio/ uses it as a first-class
+    # domain type -- the price panel is a numpy array, not a DataFrame.
+    "numpy>=2.5",
+    "scipy>=1.18",
+    # cvxpy is the optimizer engine. PyPortfolioOpt is used ONLY for
+    # BlackLittermanModel + Idzorek behind the bl_engine flag; a hand-rolled
+    # numpy BL is the tested fallback, so pypfopt never sits in the solve path.
+    "cvxpy>=1.9",
+    "pyportfolioopt>=1.6",
 ]
 
 [project.optional-dependencies]
@@ -92,7 +102,11 @@ ignore_missing_imports = false
 [[tool.mypy.overrides]]
 # yfinance ships no py.typed marker or stubs; it is confined to one module
 # (clients/market_yfinance.py) behind the MarketDataProvider interface.
-module = ["duckdb.*", "pyarrow.*", "yfinance.*"]
+# scipy likewise ships no py.typed. It has exactly one importer
+# (portfolio/metrics.py) using two functions, the normal CDF and its inverse.
+# If scipy-stubs is ever added to the dev extra, drop scipy.* from this list in
+# the same change -- warn_unused_ignores would otherwise start failing.
+module = ["duckdb.*", "pyarrow.*", "yfinance.*", "scipy.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

@@ -138,10 +138,19 @@ def event_alerts(
 ) -> list[EventAlert]:
     """Predictions fired by recent events through currently-active cells.
 
-    An event that became public within the lookback window, at a ticker, whose
-    (type, subtype) matches an active self-edge cell, yields one alert per
-    matching horizon. The prediction is that cell's measured mean move and sign;
-    the basis quotes its out-of-sample track record.
+    An event that became public within the lookback window yields one alert per
+    matching active cell. Self-edge cells predict the event ticker itself.
+    Propagation cells join through ``company_edges`` so a source event can fire
+    a plan for a connected target ticker.
+
+    That propagation join matches the edge's ``source_cik`` to the event's
+    ``cik``, never ticker to ticker. A ticker is a display symbol: it is reused
+    after a delisting and reassigned between companies, so ``ce.source_ticker =
+    e.ticker`` will happily attach one company's relationship graph to a
+    different company's event and fire a live alert for a target that has no
+    connection to it at all. ``autopilot.graph`` refuses the same join for the
+    same reason. ``cik`` is SEC's own stable identifier for the filer and both
+    tables carry it, so the join is on identity rather than on a label.
 
     The lookback covers more than one day on purpose: a daily loop that misses a
     weekend or a run must not silently drop the events in the gap.
@@ -150,7 +159,7 @@ def event_alerts(
     the ledger's dedup key, the cell's ``hit_rate``/``n_clusters`` and the
     event's ``extraction_confidence`` for its confidence score.
     """
-    rows = con.execute(
+    self_rows = con.execute(
         """
         SELECT e.ticker, e.event_type, e.event_subtype, e.available_time,
                s.horizon_days, s.direction, s.mean_car, s.hit_rate,
@@ -183,7 +192,7 @@ def event_alerts(
         event_id,
         n_clusters,
         extraction_confidence,
-    ) in rows:
+    ) in self_rows:
         hit_pct = f"{float(hit_rate):.1%}" if hit_rate is not None else "n/a"
         alerts.append(
             EventAlert(
@@ -200,6 +209,84 @@ def event_alerts(
                 n_clusters=int(n_clusters) if n_clusters is not None else 0,
                 extraction_confidence=(
                     float(extraction_confidence) if extraction_confidence is not None else None
+                ),
+            )
+        )
+
+    propagation_rows = con.execute(
+        """
+        SELECT ce.target_ticker, e.event_type, e.event_subtype, e.available_time,
+               s.horizon_days, s.direction, s.mean_car, s.hit_rate,
+               e.event_id, s.n_clusters, e.extraction_confidence,
+               ce.edge_id, ce.edge_type, e.ticker, ce.times_asserted,
+               ce.extraction_confidence
+        FROM events e
+        JOIN company_edges ce
+          ON ce.source_cik = e.cik
+        JOIN signal_status s
+          ON s.event_type = e.event_type
+         AND s.event_subtype IS NOT DISTINCT FROM e.event_subtype
+         AND s.edge_type = ce.edge_type
+         AND s.status = ?
+        WHERE e.ticker IS NOT NULL
+          AND e.cik IS NOT NULL
+          AND ce.target_ticker IS NOT NULL
+          AND ce.target_ticker != e.ticker
+          AND e.available_time IS NOT NULL
+          AND CAST(e.available_time AS DATE) > CAST(? AS DATE) - ?
+          AND CAST(e.available_time AS DATE) <= CAST(? AS DATE)
+        ORDER BY e.available_time DESC, ce.target_ticker
+        """,
+        [LadderStatus.ACTIVE.value, as_of, lookback_days, as_of],
+    ).fetchall()
+
+    for (
+        ticker,
+        etype,
+        subtype,
+        available_time,
+        horizon,
+        direction,
+        mean_car,
+        hit_rate,
+        event_id,
+        n_clusters,
+        extraction_confidence,
+        edge_id,
+        edge_type,
+        source_ticker,
+        times_asserted,
+        edge_extraction_confidence,
+    ) in propagation_rows:
+        hit_pct = f"{float(hit_rate):.1%}" if hit_rate is not None else "n/a"
+        assertions = int(times_asserted) if times_asserted is not None else 0
+        alerts.append(
+            EventAlert(
+                ticker=str(ticker),
+                event_type=str(etype),
+                event_subtype=subtype,
+                available_on=available_time.date(),
+                horizon_days=int(horizon),
+                direction=int(direction) if direction is not None else 0,
+                predicted_car=float(mean_car) if mean_car is not None else 0.0,
+                basis=(
+                    f"active {edge_type} edge from {source_ticker}, "
+                    f"holdout hit {hit_pct}, asserted {assertions}x"
+                ),
+                event_id=str(event_id) if event_id is not None else "",
+                hit_rate=float(hit_rate) if hit_rate is not None else None,
+                n_clusters=int(n_clusters) if n_clusters is not None else 0,
+                extraction_confidence=(
+                    float(extraction_confidence) if extraction_confidence is not None else None
+                ),
+                edge_id=str(edge_id) if edge_id is not None else str(edge_type),
+                edge_type=str(edge_type),
+                source_ticker=str(source_ticker) if source_ticker is not None else None,
+                times_asserted=assertions,
+                edge_extraction_confidence=(
+                    float(edge_extraction_confidence)
+                    if edge_extraction_confidence is not None
+                    else None
                 ),
             )
         )

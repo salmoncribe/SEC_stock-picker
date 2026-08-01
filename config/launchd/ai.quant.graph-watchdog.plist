@@ -3,10 +3,13 @@
   Relationship graph watchdog.
 
   Runs every three minutes while the relationship extractor is building the
-  connection graph. Each pass restarts the extractor if it is missing,
-  regenerates the Obsidian company-note projection from DuckDB when possible,
-  and sends a Telegram nudge when new company notes appear. It also sends a
-  throttled heartbeat so a silent stall is visible.
+  connection graph. Each pass restarts the extractor if it is missing and
+  regenerates the Obsidian company-note projection from DuckDB when possible.
+
+  Runs with --quiet: no Telegram messages (growth ping, heartbeat, failure
+  ping all suppressed). Michael only wants Telegram for trade alerts; this
+  agent's job is purely local (keep the extractor alive, keep the vault
+  in sync). Check logs/graph-watchdog.log for status instead.
 
   Install:
     cp config/launchd/ai.quant.graph-watchdog.plist ~/Library/LaunchAgents/
@@ -27,7 +30,7 @@
     <array>
         <string>/bin/zsh</string>
         <string>-lc</string>
-        <string>cd /Users/michaeltadlock/quant &amp;&amp; /opt/homebrew/bin/uv run python scripts/watch_relationship_graph.py</string>
+        <string>cd /Users/michaeltadlock/quant &amp;&amp; /opt/homebrew/bin/uv run python scripts/watch_relationship_graph.py --quiet</string>
     </array>
 
     <key>StartInterval</key>

@@ -108,6 +108,7 @@ def select_sections(
     latest_only: bool = False,
     limit: int | None = None,
     skip_extracted: bool = True,
+    retry_failed: bool = False,
 ) -> list[dict[str, Any]]:
     """Candidate sections to extract from, most recent filing first.
 
@@ -148,7 +149,8 @@ def select_sections(
         sql += f" AND upper(c.ticker) IN ({', '.join(['?'] * len(uppered))})"
         params.extend(uppered)
     if skip_extracted:
-        sql += """
+        processed_filter = "AND p.edge_count >= 0" if retry_failed else ""
+        sql += f"""
           AND NOT EXISTS (
               SELECT 1 FROM company_edges e
               WHERE e.accession_number = s.accession_number
@@ -157,6 +159,7 @@ def select_sections(
               SELECT 1 FROM processed_relationship_sections p
               WHERE p.accession_number = s.accession_number
                 AND p.item_code = s.item_code
+                {processed_filter}
           )
         """
     sql += " ORDER BY s.report_date DESC NULLS LAST, s.cik, s.item_code"
@@ -373,6 +376,7 @@ def sync(
     latest_only: bool = False,
     provider: LLMProvider | None = None,
     flush_every: int = DEFAULT_FLUSH_EVERY,
+    retry_failed: bool = False,
 ) -> RunSummary:
     """Extract relationship edges from filing sections into ``company_edges``."""
     llm = provider or OllamaProvider.from_config(config)
@@ -389,6 +393,7 @@ def sync(
             priced_only=priced_only,
             latest_only=latest_only,
             limit=limit,
+            retry_failed=retry_failed,
         )
         summary.bump("candidate_sections", len(candidates))
 
@@ -415,6 +420,14 @@ def sync(
             except LLMError as exc:  # one bad section must not end the run
                 summary.bump("extraction_failed")
                 summary.note(f"extraction_failed:{candidate['accession_number']}:{exc}")
+                # Make a timed-out section durable so an unattended supervisor
+                # does not select it forever. Retries are explicit.
+                _mark_processed(
+                    con,
+                    candidate=candidate,
+                    edge_count=-1,
+                    schema_version=schema_version,
+                )
                 continue
 
             summary.bump("sections_processed")

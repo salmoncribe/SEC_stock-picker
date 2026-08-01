@@ -85,6 +85,11 @@ class EventAlert:
     hit_rate: float | None = None
     n_clusters: int = 0
     extraction_confidence: float | None = None
+    edge_id: str = "self"
+    edge_type: str = "self"
+    source_ticker: str | None = None
+    times_asserted: int = 0
+    edge_extraction_confidence: float | None = None
 
 
 @dataclass(frozen=True)

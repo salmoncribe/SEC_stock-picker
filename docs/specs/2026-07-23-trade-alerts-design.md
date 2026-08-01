@@ -207,3 +207,63 @@ Defaults are placeholders to make the pipeline runnable; the user owns every val
   loop, manual end-to-end run → first trade-alert text delivered.
 - **Phase B (next):** `collectors/gaps.py`, `scan-gaps` CLI, morning LaunchAgent, alert
   grading in the daily loop, `require_catalyst` refinement after observing live gaps.
+- **Phase C (2026-07-27):** gap calibration loop -- `signals/gap_calibration.py`,
+  `gap_calibration_stats` table, wired into `gaps.py`'s confidence scoring and the daily
+  orchestrator. See §12.
+
+## 12. Gap calibration loop (Phase C)
+
+§5 flagged that gap alerts cap at 50 (`has_track_record=False`) "until graded ledger
+history accumulates." Grading (§6) already produces that history for every `trade_alerts`
+row regardless of `kind` -- it just had nowhere gap-specific to land, because the
+`impact_stats`/`signal_status` gate (`signals/impact.py`) is keyed on `event_samples` rows
+(`event_type`, `event_subtype`, `edge_id`, `horizon_days`), and a `price_gap` alert has no
+`event_id` to join on. Rather than force that fit, this is a second, simpler gate built
+specifically for the gap path.
+
+**Bucketing.** Each graded `price_gap` row is assigned to a bucket keyed on what was known
+*at fire time*: `direction` (already a column), a gap-size bucket derived from
+`evidence.gap_pct` (`"small"` / `"medium"` / `"large"` at fixed 3%/6% cutoffs -- a
+human-legible judgment call, flagged as tunable in the code, not a discovery), and whether
+a catalyst was attached (`evidence.catalyst` is a dict vs. the literal string
+`"no catalyst"`). `bucket_id = f"{direction}:{gap_size_bucket}:{catalyst_present}"` is the
+deterministic key both the aggregator and the lookup compute identically, so they can never
+drift apart.
+
+**`gap_calibration_stats`** (one row per bucket, rebuilt by delete + reinsert every run --
+the bucket count is small enough that an incremental upsert would only add bug surface):
+`bucket_id` (PK), `direction`, `gap_size_bucket`, `catalyst_present`, `n_decisive` (count of
+`hit_target` + `hit_stop` -- an `expired` row is not a win or a loss), `n_expired`,
+`hit_rate` (wins / decisive, NULL when `n_decisive = 0`), `mean_return` (mean
+`outcome_return` across every graded row in the bucket, expired included), `last_updated`.
+
+**Feeding it back into confidence.** `gaps.py`'s candidate build now looks its own bucket up
+in `gap_calibration_stats` before scoring (`gap_calibration.lookup_track_record`, using the
+same connection the write phase already has open -- no extra DB round trip). A bucket with
+at least one decisive outcome flips `has_track_record=True` and passes its `(hit_rate,
+n_decisive)` through as `(hit_rate, n_clusters)`; an empty or still-undecided bucket falls
+back to exactly the original hardcoded `has_track_record=False`. No new minimum-sample gate
+was added on top of that -- `signals/confidence.shrunk_hit_rate` already pulls a thin
+bucket's hit rate toward 50 as `n_decisive` grows from 1, so a freshly-decisive bucket earns
+almost nothing until real sample size accumulates, and a hard floor would just be a second,
+redundant knob doing the same job.
+
+**Orchestrator.** A new step, `calibrate-gap-confidence`, runs immediately after
+`grade-trade-alerts` (so it sees today's freshly-graded outcomes) and before everything
+else, the same non-critical/housekeeping tier as grading itself. `gaps.scan` (the separate
+~15-minute morning-scan process) reads whatever `gap_calibration_stats` holds at the moment
+it fires; it does not itself recompute calibration.
+
+**Delivery.** Newly-graded alerts (`WHERE outcome != 'open' AND graded_at` on today) get
+their own Telegram message and Obsidian section, predicted plan next to actual outcome, with
+one deterministic (no LLM) diagnosis line per outcome -- `hit_target` / `hit_stop` read
+directly off the outcome; `expired` reads the sign of the already direction-adjusted
+`outcome_return` (positive means the position drifted toward the win side but ran out of
+time; non-positive means it drifted against). The current `gap_calibration_stats` table also
+renders as its own Obsidian section, so the calibration state is browsable day to day, not
+just a scrolling phone message.
+
+**No-regression guarantee.** With `gap_calibration_stats` empty -- today's real state, 93
+open `price_gap` alerts, 0 graded -- every new gap alert scores identically to before this
+phase: `has_track_record=False`, capped at 50. This is pinned by an explicit test
+(`tests/test_gaps.py`) that spies on `signals.confidence.score`'s inputs.

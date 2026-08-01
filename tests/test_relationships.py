@@ -214,7 +214,14 @@ def test_empty_section_is_marked_processed(tmp_config: Config) -> None:
     _seed(tmp_config, "")
 
     first_provider = StubProvider(
-        [{"target": "Microsoft Corporation", "type": "customer", "evidence": "x", "confidence": 0.9}]
+        [
+            {
+                "target": "Microsoft Corporation",
+                "type": "customer",
+                "evidence": "x",
+                "confidence": 0.9,
+            }
+        ]
     )
     first = relationships.sync(tmp_config, provider=first_provider)
     second_provider = StubProvider([])

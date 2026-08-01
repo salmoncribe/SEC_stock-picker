@@ -22,6 +22,23 @@ import duckdb
 
 Row = dict[str, Any]
 
+# _existing_keys and _update each build one SQL statement embedding a
+# VALUES row per item in the batch, plus a flat ? parameter per value. Doing
+# that for the whole batch in one shot is fine for a few thousand rows, but
+# for a million-plus-row batch (e.g. upsert_daily_returns recomputing the
+# full estimation window) DuckDB has to materialize the entire VALUES
+# relation and parameter set before it can even start the join -- a live
+# incident hit ~16GB RSS updating 1.56M rows in one statement and had to be
+# killed before it took down the machine. Chunking bounds memory to
+# O(chunk_size) regardless of how large the caller's batch is; see the
+# empirical sizing note above `_BATCH_CHUNK_ROWS`.
+_BATCH_CHUNK_ROWS = 10_000
+
+
+def _chunked(items: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
 
 @dataclass(frozen=True)
 class UpsertResult:
@@ -58,10 +75,45 @@ def _existing_keys(
     con: duckdb.DuckDBPyConnection,
     table: str,
     key_cols: Sequence[str],
+    candidates: Sequence[tuple[Any, ...]],
 ) -> set[tuple[Any, ...]]:
+    """Existing key tuples for ``table``, scoped to rows that could match ``candidates``.
+
+    A plain ``SELECT key_cols FROM table`` re-fetches and rebuilds a Python set
+    from every row in the table on every call -- cheap while a table is a few
+    thousand rows, a multi-minute stall once it is millions, because callers
+    that flush incrementally (per symbol, per target) pay that full cost once
+    per flush. Only rows matching something in this batch can ever affect the
+    insert/update split, so a join scoped to the batch's own keys is the same
+    answer for O(batch) instead of O(table). ``IS NOT DISTINCT FROM`` (not
+    ``=``) so a NULL key part still matches, same as the old Python-side
+    ``key in existing`` check did.
+
+    Chunked into ``_BATCH_CHUNK_ROWS``-sized JOIN queries -- see the module
+    comment above that constant -- so a million-plus-row batch doesn't force
+    DuckDB to build one giant VALUES relation in memory.
+    """
+    if not candidates:
+        return set()
     columns = ", ".join(f'"{col}"' for col in key_cols)
-    result = con.execute(f'SELECT {columns} FROM "{table}"').fetchall()
-    return {tuple(record) for record in result}
+    value_cols = [f"c{i}" for i in range(len(key_cols))]
+    join_cond = " AND ".join(
+        f't."{col}" IS NOT DISTINCT FROM b.{value_col}'
+        for col, value_col in zip(key_cols, value_cols, strict=True)
+    )
+    existing: set[tuple[Any, ...]] = set()
+    for chunk in _chunked(candidates, _BATCH_CHUNK_ROWS):
+        row_placeholder = "(" + ", ".join("?" for _ in key_cols) + ")"
+        values_clause = ", ".join([row_placeholder] * len(chunk))
+        sql = f"""
+            SELECT {columns} FROM "{table}" t
+            JOIN (VALUES {values_clause}) AS b({", ".join(value_cols)})
+              ON {join_cond}
+        """
+        params = [value for candidate in chunk for value in candidate]
+        result = con.execute(sql, params).fetchall()
+        existing.update(tuple(record) for record in result)
+    return existing
 
 
 def _insert(
@@ -84,18 +136,54 @@ def _update(
     columns: Sequence[str],
     immutable_on_update: Sequence[str],
 ) -> None:
+    """Apply the whole batch as one ``UPDATE ... FROM (VALUES ...)`` statement.
+
+    The previous implementation fired one ``UPDATE ... WHERE key IS NOT
+    DISTINCT FROM ?`` per row via ``executemany``. DuckDB has no point-lookup
+    index for arbitrary key columns, so each row was a full table scan --
+    O(updates x table_size), which stalled for hours against a multi-GB
+    table. Joining the whole batch against the table in one pass, the same
+    "VALUES clause of candidates" pattern :func:`_existing_keys` uses above,
+    is O(batch) instead.
+
+    That single-statement version is itself chunked into
+    ``_BATCH_CHUNK_ROWS``-sized statements -- see the module comment above
+    that constant. Without chunking, a million-plus-row batch (e.g.
+    ``upsert_daily_returns`` recomputing a rolling window over the whole
+    symbol universe) makes DuckDB materialize one giant VALUES relation plus
+    a matching flat parameter list in a single call, which is what drove a
+    live process to ~16GB RSS and had to be killed.
+    """
     frozen = set(key_cols) | set(immutable_on_update)
     set_cols = [col for col in columns if col not in frozen]
-    if not set_cols:
+    if not set_cols or not rows:
         return
-    set_clause = ", ".join(f'"{col}" = ?' for col in set_cols)
+    key_value_cols = [f"k{i}" for i in range(len(key_cols))]
+    set_value_cols = [f"s{i}" for i in range(len(set_cols))]
+    all_value_cols = key_value_cols + set_value_cols
+    set_clause = ", ".join(
+        f'"{col}" = b.{value_col}' for col, value_col in zip(set_cols, set_value_cols, strict=True)
+    )
     # IS NOT DISTINCT FROM so NULL key parts (e.g. realtime bounds) match.
-    where_clause = " AND ".join(f'"{col}" IS NOT DISTINCT FROM ?' for col in key_cols)
-    sql = f'UPDATE "{table}" SET {set_clause} WHERE {where_clause}'
-    params = [
-        [row.get(col) for col in set_cols] + [row.get(col) for col in key_cols] for row in rows
-    ]
-    con.executemany(sql, params)
+    join_cond = " AND ".join(
+        f't."{col}" IS NOT DISTINCT FROM b.{value_col}'
+        for col, value_col in zip(key_cols, key_value_cols, strict=True)
+    )
+    for chunk in _chunked(rows, _BATCH_CHUNK_ROWS):
+        row_placeholder = "(" + ", ".join("?" for _ in all_value_cols) + ")"
+        values_clause = ", ".join([row_placeholder] * len(chunk))
+        sql = f"""
+            UPDATE "{table}" AS t
+            SET {set_clause}
+            FROM (VALUES {values_clause}) AS b({", ".join(all_value_cols)})
+            WHERE {join_cond}
+        """
+        params = [
+            value
+            for row in chunk
+            for value in ([row.get(col) for col in key_cols] + [row.get(col) for col in set_cols])
+        ]
+        con.execute(sql, params)
 
 
 def upsert(
@@ -124,11 +212,11 @@ def upsert(
                     ordered.append(col)
         columns = ordered
 
-    existing = _existing_keys(con, table, key_cols)
+    candidates = [tuple(row.get(col) for col in key_cols) for row in materialized]
+    existing = _existing_keys(con, table, key_cols, candidates)
     to_insert: list[Row] = []
     to_update: list[Row] = []
-    for row in materialized:
-        key = tuple(row.get(col) for col in key_cols)
+    for row, key in zip(materialized, candidates, strict=True):
         (to_update if key in existing else to_insert).append(row)
 
     if to_insert:
@@ -140,6 +228,68 @@ def upsert(
 
 
 TRADE_ALERT_KEY = ("kind", "ticker", "trigger_key")
+
+
+def insert_append_only(
+    con: duckdb.DuckDBPyConnection,
+    table: str,
+    rows: Iterable[Row],
+    *,
+    key_cols: Sequence[str],
+) -> list[Row]:
+    """Insert only previously unseen rows using an explicit natural key.
+
+    This is intentionally narrower than :func:`upsert`.  Decision attempts,
+    source receipts, health reports and kill-switch history are audit facts;
+    changing a previous one would make a later reconstruction impossible.
+    The caller supplies the key so every append-only table documents its
+    idempotency rule at its call site.
+    """
+    materialized = [dict(row) for row in rows]
+    if not materialized:
+        return []
+    materialized = _dedupe_last_wins(materialized, key_cols)
+    candidates = [tuple(row.get(c) for c in key_cols) for row in materialized]
+    existing = _existing_keys(con, table, key_cols, candidates)
+    fresh = [row for row in materialized if tuple(row.get(c) for c in key_cols) not in existing]
+    if fresh:
+        columns = [row[1] for row in con.execute(f'PRAGMA table_info("{table}")').fetchall()]
+        _insert(con, table, fresh, columns)
+    return fresh
+
+
+OPPORTUNITY_KEY = ("event_id", "edge_id", "target_ticker", "horizon_days", "strategy_version")
+DECISION_KEY = ("opportunity_id", "input_hash", "prompt_version", "model_version", "attempt_number")
+
+
+def upsert_relationship_opportunities(
+    con: duckdb.DuckDBPyConnection, rows: Iterable[Row]
+) -> UpsertResult:
+    """Persist the current evaluation state without rewriting its evidence hash.
+
+    A natural-key repeat represents a re-evaluation of the same strategy
+    family. The original creation time remains immutable, while a changed
+    evidence packet creates a new hash and an explicit updated state.
+    """
+    columns = [
+        row[1]
+        for row in con.execute('PRAGMA table_info("relationship_opportunities")').fetchall()
+    ]
+    return upsert(
+        con,
+        "relationship_opportunities",
+        rows,
+        key_cols=OPPORTUNITY_KEY,
+        columns=columns,
+        immutable_on_update=("opportunity_id", "created_at"),
+    )
+
+
+def insert_opportunity_decisions(
+    con: duckdb.DuckDBPyConnection, rows: Iterable[Row]
+) -> list[Row]:
+    """Append model attempts; failed/duplicate attempts are still auditable."""
+    return insert_append_only(con, "opportunity_decisions", rows, key_cols=DECISION_KEY)
 
 
 def insert_new_trade_alerts(
@@ -166,7 +316,8 @@ def insert_new_trade_alerts(
     if not materialized:
         return []
     materialized = _dedupe_last_wins(materialized, TRADE_ALERT_KEY)
-    existing = _existing_keys(con, "trade_alerts", TRADE_ALERT_KEY)
+    candidates = [tuple(r.get(c) for c in TRADE_ALERT_KEY) for r in materialized]
+    existing = _existing_keys(con, "trade_alerts", TRADE_ALERT_KEY, candidates)
     fresh = [
         r for r in materialized
         if tuple(r.get(c) for c in TRADE_ALERT_KEY) not in existing
@@ -379,6 +530,50 @@ SIGNAL_STATUS_COLUMNS: tuple[str, ...] = (
 )  # fmt: skip
 
 
+PEOPLE_COLUMNS: tuple[str, ...] = (
+    "person_id", "reporting_owner_cik", "canonical_name", "name_variants",
+    "first_seen_filing_date", "last_seen_filing_date", "source", "source_url",
+    "content_hash", "schema_version", "validation_status", "validation_errors",
+    "collected_time",
+)  # fmt: skip
+
+
+ROLE_MEMBERSHIP_COLUMNS: tuple[str, ...] = (
+    "role_id", "person_id", "company_id", "is_officer", "is_director",
+    "is_ten_pct_owner", "latest_officer_title", "first_seen", "last_seen",
+    "source_filing_count", "source", "source_url", "content_hash",
+    "schema_version", "validation_status", "validation_errors", "collected_time",
+)  # fmt: skip
+
+
+def upsert_people(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
+    """Upsert person identities, keyed on ``reporting_owner_cik``.
+
+    ``first_seen_filing_date`` is immutable on update so the row keeps the
+    moment this person was first observed, mirroring ``upsert_companies``.
+    """
+    return upsert(
+        con,
+        "people",
+        rows,
+        key_cols=["reporting_owner_cik"],
+        columns=PEOPLE_COLUMNS,
+        immutable_on_update=["first_seen_filing_date"],
+    )
+
+
+def upsert_role_memberships(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
+    """Upsert person-to-company roles, keyed on ``(person_id, company_id)``."""
+    return upsert(
+        con,
+        "role_memberships",
+        rows,
+        key_cols=["person_id", "company_id"],
+        columns=ROLE_MEMBERSHIP_COLUMNS,
+        immutable_on_update=["first_seen"],
+    )
+
+
 COMPANY_EDGE_COLUMNS: tuple[str, ...] = (
     "edge_id", "edge_key", "source_cik", "source_ticker", "source_company_id",
     "target", "target_name", "target_cik", "target_ticker", "edge_type",
@@ -430,17 +625,26 @@ def upsert_signal_status(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) ->
     )
 
 
+#: ``event_samples``' natural key, matching the table's own UNIQUE constraint.
+#: ``target_ticker`` is part of it because propagation fans one event out to
+#: several targets under the same edge type: an insider buy at NKE scores both
+#: ONON and LULU as "competitor" at the same horizon, and those are distinct
+#: observations, not the same row overwritten. For a self edge the target equals
+#: the source, so this changes nothing.
+#:
+#: Exported rather than inlined below so a producer that has to collapse its own
+#: batch before offering it (``signals.dataset.build_propagation``) keys that
+#: collapse on the same tuple this upsert does, instead of a hand-copied one
+#: that can drift out of step with the constraint.
+EVENT_SAMPLE_KEY: tuple[str, ...] = ("event_id", "edge_id", "horizon_days", "target_ticker")
+
+
 def upsert_event_samples(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
-    # ``target_ticker`` is part of the key because propagation fans one event out
-    # to several targets under the same edge type: an insider buy at NKE scores
-    # both ONON and LULU as "competitor" at the same horizon, and those are
-    # distinct observations, not the same row overwritten. For a self edge the
-    # target equals the source, so this changes nothing.
     return upsert(
         con,
         "event_samples",
         rows,
-        key_cols=["event_id", "edge_id", "horizon_days", "target_ticker"],
+        key_cols=EVENT_SAMPLE_KEY,
         columns=SAMPLE_COLUMNS,
     )
 
@@ -458,6 +662,59 @@ def upsert_events(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> Upsert
         rows,
         key_cols=["event_type", "event_key"],
         columns=EVENT_COLUMNS,
+    )
+
+
+PAPER_ORDER_COLUMNS: tuple[str, ...] = (
+    "paper_order_id", "opportunity_id", "symbol", "side", "quantity",
+    "quantity_exact", "reason", "limit_price", "submitted_at", "status",
+    "simulation_version",
+)  # fmt: skip
+
+PAPER_FILL_COLUMNS: tuple[str, ...] = (
+    "paper_fill_id", "paper_order_id", "symbol", "fill_price", "quantity",
+    "quantity_exact", "filled_at", "fees", "borrow_cost", "slippage",
+    "fill_assumptions",
+)  # fmt: skip
+
+#: ``paper_orders``' natural key, matching the table's own UNIQUE constraint.
+PAPER_ORDER_KEY: tuple[str, ...] = ("opportunity_id", "simulation_version")
+
+#: ``paper_fills``' natural key, matching the table's own UNIQUE constraint.
+PAPER_FILL_KEY: tuple[str, ...] = ("paper_order_id", "filled_at")
+
+
+def upsert_paper_orders(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
+    """Upsert simulated orders, keyed on ``(opportunity_id, simulation_version)``.
+
+    Upsert rather than ``insert_append_only``: a paper order is a *derived*
+    artefact of replaying a deterministic strategy over a fixed date, not an
+    audit fact, so a re-run must be able to rewrite it in place. The version is
+    part of the key so a scratch experiment writes beside the ledger of record
+    instead of over it.
+    """
+    return upsert(
+        con,
+        "paper_orders",
+        rows,
+        key_cols=PAPER_ORDER_KEY,
+        columns=PAPER_ORDER_COLUMNS,
+    )
+
+
+def upsert_paper_fills(con: duckdb.DuckDBPyConnection, rows: Iterable[Row]) -> UpsertResult:
+    """Upsert simulated fills, keyed on ``(paper_order_id, filled_at)``.
+
+    ``paper_fills`` carries no ``simulation_version`` column of its own; the
+    version travels on the parent order, and every fill id is already version
+    suffixed, so this key cannot collide across versions.
+    """
+    return upsert(
+        con,
+        "paper_fills",
+        rows,
+        key_cols=PAPER_FILL_KEY,
+        columns=PAPER_FILL_COLUMNS,
     )
 
 

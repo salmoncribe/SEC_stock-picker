@@ -10,13 +10,18 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from typer.testing import CliRunner
 
+from market_intelligence.analytics import backtest_data
+from market_intelligence.analytics import cluster_buy as cluster_buy_analytics
+from market_intelligence.analytics import interlocks as interlocks_analytics
 from market_intelligence.cli import app
 from market_intelligence.collectors import RunSummary
 from market_intelligence.collectors import gaps as gaps_collector
+from market_intelligence.collectors import roles as roles_collector
 from market_intelligence.config import reset_config_cache
 
 runner = CliRunner()
@@ -142,3 +147,89 @@ def test_scan_gaps_raising_exits_one(monkeypatch: pytest.MonkeyPatch) -> None:
     result = runner.invoke(app, ["market", "scan-gaps"])
 
     assert result.exit_code == 1
+
+
+# --------------------------------------------------------------------------- #
+# people subcommands                                                          #
+# --------------------------------------------------------------------------- #
+def test_people_help() -> None:
+    result = runner.invoke(app, ["people", "--help"])
+    assert result.exit_code == 0
+    assert "sync-roles" in result.output
+    assert "project-interlocks" in result.output
+    assert "detect-cluster-buys" in result.output
+
+
+def test_people_sync_roles_invokes_collector_and_exits_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_sync(config: object) -> RunSummary:
+        return RunSummary(pipeline_name="people.sync-roles", status="success")
+
+    monkeypatch.setattr(roles_collector, "sync", fake_sync)
+    result = runner.invoke(app, ["people", "sync-roles"])
+
+    assert result.exit_code == 0
+
+
+def test_people_project_interlocks_invokes_analytics_and_exits_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_project(config: object, **kwargs: object) -> RunSummary:
+        return RunSummary(pipeline_name="people.project-interlocks", status="success")
+
+    monkeypatch.setattr(interlocks_analytics, "project", fake_project)
+    result = runner.invoke(app, ["people", "project-interlocks"])
+
+    assert result.exit_code == 0
+
+
+def test_people_detect_cluster_buys_invokes_analytics_and_exits_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_detect(config: object, **kwargs: object) -> RunSummary:
+        return RunSummary(pipeline_name="people.detect-cluster-buys", status="success")
+
+    monkeypatch.setattr(cluster_buy_analytics, "detect", fake_detect)
+    result = runner.invoke(app, ["people", "detect-cluster-buys"])
+
+    assert result.exit_code == 0
+
+
+def test_people_sync_roles_raising_exits_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_sync(config: object) -> RunSummary:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(roles_collector, "sync", fake_sync)
+    result = runner.invoke(app, ["people", "sync-roles"])
+
+    assert result.exit_code == 1
+
+
+def test_signals_project_graph_writes_company_and_person_notes() -> None:
+    result = runner.invoke(app, ["signals", "project-graph"])
+    assert result.exit_code == 0
+    assert "company note" in result.output
+    assert "person note" in result.output
+
+
+def test_signals_backtest_on_an_empty_db_explains_itself() -> None:
+    result = runner.invoke(app, ["signals", "backtest"])
+    assert result.exit_code == 0
+    assert "No tradeable cells" in result.output
+
+
+def test_signals_backtest_does_not_touch_the_holdout_unless_asked() -> None:
+    """The holdout is the one number that must not be read while tuning."""
+    captured: list[tuple[str, ...]] = []
+    original = backtest_data.load_replay_inputs
+
+    def spy(con, **kwargs):
+        captured.append(kwargs["splits"])
+        return original(con, **kwargs)
+
+    with patch.object(backtest_data, "load_replay_inputs", spy):
+        runner.invoke(app, ["signals", "backtest"])
+        runner.invoke(app, ["signals", "backtest", "--holdout"])
+
+    assert captured == [("discovery",), ("discovery", "holdout")]

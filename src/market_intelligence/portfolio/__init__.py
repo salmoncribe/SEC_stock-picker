@@ -9,11 +9,19 @@ Layering, strictly downward -- no module imports one below it:
 
     account   costs   metrics   stops   (pure, no internal deps)
     feed                               (the one bounded DB read)
+    pit_guard                          (feed; OPT-IN, imported by nothing below)
     risk                               (numpy; account, for the HWM decay)
     views                              (risk)
     optimizer                          (risk, views)
     simulator                          (everything above)
     store   report                     (persistence / rendering edges)
+
+``pit_guard`` sits outside the replay path on purpose: it wraps ``feed``'s
+``MarketPanel`` and signal dicts behind a declared "as of" clock that raises on
+a lookahead read instead of silently returning one, for tests and in-progress
+features that want that guarantee. ``simulator`` does not import it and never
+will by default -- see ``pit_guard``'s own module docstring for what it does
+and, as importantly, does not catch.
 
 Domain math is numpy. **No pandas in domain code** -- the price panel is a
 ``[T, N]`` float64 array, not a DataFrame, because 633 symbols x 2520 days x 5

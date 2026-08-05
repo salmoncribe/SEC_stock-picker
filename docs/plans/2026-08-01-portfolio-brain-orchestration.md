@@ -339,3 +339,412 @@ These touch the live system or the 7.2 GB DB and stay with Michael + orchestrato
 2. **Running `signals build-propagation`** — 7.2 GB DB, prior 3 h 40 m hang, bounded write windows.
 3. **Any `--write` run** against the account of record.
 4. **The sealed holdout read** — once, ever.
+
+---
+
+## 5g. Pricing the 30%/yr target (2026-08-01)
+
+Michael's standing goal is ≥30%/yr. This section prices it rather than
+argues about it. Everything below is measured on the reconstructed
+20-day discovery bundle (`scratchpad/rebuild_bundle.py`), whose baseline
+reads 8.82% where the canonical replay reads 8.25% — close, not identical,
+so treat these as **relative** comparisons within the table, not as
+replacements for canonical numbers.
+
+### The governing identity
+
+`return ≈ Sharpe × volatility`. There is no third term. Every route to
+30%/yr is therefore a claim about one of those two factors, and naming
+which one it is settles most of the argument.
+
+### Two hard blocks meant leverage had never been measured at all
+
+1. `PortfolioConfig.max_gross` is `Field(default=1.0, gt=0.0, le=1.0)` —
+   pydantic **rejects** any levered config. Not a default: a schema bound.
+2. `simulator.py:428` calls `vol_target_scale` without `cap`, taking the
+   `cap=1.0` default, whose docstring reads *"Never levers up."*
+
+So §5e's "raising the risk budget does NOT raise returns" was measuring a
+dial that can only cut — which is why every row came back near 10.9%
+realized vol regardless of target. **It did not test leverage.** Nothing
+above 100% gross had ever been run on this strategy.
+
+### Leverage frontier — raw, then net of financing
+
+The simulator charges **no margin interest**; borrowing is free inside it.
+Financing is therefore applied post-hoc on the borrowed portion,
+`max(0, gross − 1) × equity`, at 6%/yr (≈ fed funds + 1.5%).
+
+| cap | realized gross | CAGR | vol | Sharpe | maxDD | net @6% |
+|---|---|---|---|---|---|---|
+| 1.0x (shipped) | 0.74x | 8.82% | 11.84% | 0.74 | 17.99% | **8.82%** |
+| 1.5x | 1.18x | 12.54% | 14.66% | 0.86 | 20.92% | **11.44%** |
+| 2.0x | 1.60x | 11.95% | 15.41% | 0.78 | 21.69% | 8.36% |
+| 2.5x | 2.05x | 13.25% | 15.63% | 0.85 | 21.79% | 6.97% |
+| 3.0x | 2.51x | 13.91% | 15.45% | 0.90 | 24.87% | 4.85% |
+| 4.0x | 3.63x | 17.84% | 15.98% | 1.12 | 19.13% | 2.04% |
+
+**Financing prices leverage out.** Raw return rises monotonically; net
+return peaks at ~1.5× and is *negative-sloping* thereafter. Leverage is
+worth ≈ +2.6 points, not +9.
+
+Two caveats on this table. Turnover is ~1200–1300%/yr in **every** row —
+all of it breaches the 400%/yr preregistered cap, because this is the
+20-day-horizon bundle. And maxDD is non-monotonic (4.0× is *lower* than
+3.0×), which on a single historical path is noise, not a relationship.
+
+### The Sharpe rise was not leverage — it was suppressed breadth
+
+Sharpe climbing 0.74 → 1.12 with leverage is impossible on its face:
+scaling every weight by k scales excess return and vol alike, leaving the
+ratio fixed. Re-running with `target_vol` **pinned at 12%** so the scaler
+removes the extra gross isolates the cause:
+
+| max_gross | realized gross | names held | CAGR | vol | Sharpe |
+|---|---|---|---|---|---|
+| 1.0x | 0.74x | 10.5 | 8.82% | 11.84% | 0.74 |
+| 1.5x | 0.82x | 12.9 | 8.86% | 11.73% | 0.76 |
+| 2.0x | 0.85x | 15.1 | 9.58% | 11.71% | 0.82 |
+| 3.0x | 0.91x | 18.1 | **10.07%** | 11.68% | **0.86** |
+| 4.0x | 0.93x | 20.2 | 9.97% | 11.70% | 0.85 |
+
+Realized gross stays **below 1.0 in every row** — no borrowing occurs,
+no financing is owed — and realized vol is flat at ~11.7%. Yet names held
+doubles and Sharpe rises 16%.
+
+`max_gross=1.0` against `max_position=0.15` was forcing a corner solution:
+at most ~7 names at full weight, so funding a new position meant shrinking
+a good one. The cap was never a risk control — **it was a breadth ceiling**,
+and it cost ~1.25 points of CAGR at identical risk.
+
+Grinold sanity check: 10.5 → 20.2 names is 1.92× breadth, predicting
+√1.92 = 1.39× Sharpe, i.e. 0.74 → 1.03. Observed 0.86 — about half the
+theoretical benefit, which is what correlated (not independent) bets
+drawn largely from one signal family should give. The mechanism is
+consistent with the theory; the shortfall is the honest measure of how
+little independence these 24 cells actually carry.
+
+Saturates by 3.0×. **This is a free improvement and it is still a
+parameter choice**: it enters the preregistered sweep as a declared
+dimension, it is not selected by eye here.
+
+### What 30%/yr actually costs
+
+At the best honest Sharpe measured (0.86, unlevered, breadth-relaxed):
+
+- 30% needs **35% volatility** — roughly 3× the current book
+- peak-to-trough drawdowns scale with vol: expect **~60–70%**
+- to reach 30% at a 20% vol budget instead requires **Sharpe 1.5**, i.e.
+  ~3× the independent breadth currently available
+
+Stacking every honest lever — breadth cap (+1.25), cash drag (~+2, §5h
+pending), modest 1.5× leverage (+2.6) — lands near **14–15%/yr**, plus
+whatever the long-horizon cells admit. That is roughly double the shipped
+figure and it is not 30%.
+
+**30% remains available as a dial, not as a free lunch**: it is a 35%-vol
+configuration. The system should be *able* to express it — that is what
+unblocking `max_gross` provides — and whether to run there is Michael's
+call, made against the drawdown number, not against the return number
+alone.
+
+---
+
+## 5h. The preregistered sweep — 2,328 configs (2026-08-01)
+
+Grid declared and hashed **before** the first replay:
+`sweep_grid.json`, `sha256 f593afee48eef224663a2120775f8d43…`, N = 2,328.
+Arm A `max_sharpe` (2,304) × arm B `min_cvar` (24). Seven axes: `max_gross`
+{1,2,3,4}, `target_vol` {.10,.12,.18,.25,.35,.50}, `max_position`
+{.10,.15,.25,.35}, `risk_aversion` {1,2.5,5}, `rebalance_days` {1,5,10,20},
+`no_trade_band` {.005,.02}, `objective`. Everything else pinned. 44.1 minutes
+on 9 workers, 0 failures. Discovery split only; the holdout was not touched.
+
+N is read from the preregistration file, never from the surviving rows —
+deflating against survivors is the precise self-deception DSR exists to stop.
+
+### The range
+
+| | CAGR | net of 6% financing |
+|---|---|---|
+| worst | 4.31% | −10.23% |
+| median | 10.96% | 8.62% |
+| **best** | **20.39%** | **15.41%** |
+
+**16.1 points of CAGR from configuration alone**, on identical signals,
+identical prices, identical dates. The best *net* config is unlevered
+(realized gross 0.85×, so it borrows nothing): 15.41% at 16.3% vol and
+19.3% maxDD. The best *raw* config nets only 3.97% — 3.74× gross, and
+financing takes 16 points straight back.
+
+**30%/yr does not appear anywhere on this surface.** The ceiling of this
+signal set under any of 2,328 configurations is 20.4% raw / 15.4% net.
+
+### Zero configurations are admissible
+
+Not one of the 2,304 trading configs satisfies the preregistered 400%/yr
+turnover cap. The cheapest-trading config found runs **615%/yr**; the median
+runs 1,190%. This is horizon arithmetic, not a tuning failure —
+`turnover ≈ 2·gross·252/holding_days`, so at 20-day holds even gross 0.5
+implies ~1,260%/yr. **The strategy as configured cannot be run inside its own
+declared constraints at this horizon.** Either the cap moves, on a stated
+argument about capacity and cost, or the holding period does.
+
+### The edge is real; the configuration is not
+
+Two results that look contradictory and are not — they answer different
+questions:
+
+| test | result | gate | |
+|---|---|---|---|
+| DSR (N=2,328 declared) | **0.9871** | ≥0.95 | **PASS** |
+| PBO, n_blocks 10/12/16 | **0.484 / 0.502 / 0.462** | ≤0.20 | **FAIL** |
+| split-half Spearman ρ | **0.076** | — | ~zero |
+
+- **DSR passes.** Best daily Sharpe 0.0747 (1.18 annualized) against an
+  E[max SR] null of 0.0303 (0.48 annualized) *after* deflating for 2,328
+  trials. The top Sharpe is not a search artifact — there is real edge here.
+- **PBO fails at ≈0.5**, which is precisely the coin-flip value. The
+  in-sample winner lands in the bottom half out-of-sample about half the time.
+- **Split-half confirms it**: rank every config on years 1–5 and re-rank on
+  6–10 and ρ = 0.076 (significant only because n=2,304; the effect is ~nil).
+  Top-decile overlap 20% against 10% by chance. **The first-half winner ranks
+  #464 of 2,304 in the second half.**
+
+The synthesis: **the strategy has edge, but which configuration is best is
+unknowable.** Tuning does not transfer. Any config chosen off the top of this
+table is being chosen on noise, and the honest procedure is to pick by stated
+risk preference rather than by backtest rank.
+
+### Only two of seven axes move anything — and both are risk dials
+
+| axis | median-CAGR spread | verdict |
+|---|---|---|
+| `target_vol` | **6.44%** | dominant, monotone |
+| `max_gross` | **2.31%** | real, saturates at 2.0× |
+| `rebalance_days` | 1.47% | noise |
+| `max_position` | 1.21% | noise |
+| `risk_aversion` | 0.65% | noise |
+| `no_trade_band` | 0.06% | nothing at all |
+
+`target_vol` is buying return with volatility, not skill — across .10 → .50
+the median CAGR goes 7.57% → 14.01% while median Sharpe moves only
+0.75 → 0.87 and median maxDD goes 17.96% → 22.35%. It is the
+`return = Sharpe × vol` identity showing up in the data.
+
+Critically, **net of financing that dial has an interior optimum**: median
+net@6% peaks at `target_vol` 0.18 (10.12%) and falls to 3.84% by 0.50.
+Likewise `max_gross` has its *highest* median net at 1.0× — it raises raw
+CAGR but only helps net when it does not actually borrow. This refines §5g:
+the breadth gain there was measured with `target_vol` pinned at 12%, which
+held realized gross below 1.0. **Raise the cap for breadth, not for leverage.**
+
+### Defect found: `min_cvar` never takes a position
+
+All 24 `min_cvar` configs returned a perfectly flat curve — ending equity
+exactly 10,000.00, zero fills, zero gross — across every combination of
+gross, vol target, position cap and rebalance frequency, while all 2,304
+`max_sharpe` configs on the same bundle traded normally. A pure
+minimize-CVaR objective with only inequality caps has `w = 0` as its global
+optimum, so this is likely a missing budget or return-floor constraint at
+`optimizer.py:511`. Its tests pass because they assert solver status rather
+than that anything was held. Filed separately; `min_cvar` must be treated as
+unmeasured, not as a low-risk result.
+
+### What this does and does not license
+
+It does **not** license picking the 20.39% row, or any row. PBO says that
+choice is noise. What it licenses is the opposite and more useful claim: the
+five noise axes can be frozen at their defaults with no expected cost, and
+the two that matter are risk preferences for Michael to set explicitly — with
+the drawdown and financing numbers attached, and with the turnover cap
+renegotiated in the open rather than quietly breached.
+
+---
+
+## 5i. CORRECTION — §5h was measured on an invalid feed
+
+**Discard §5h's numbers.** That sweep ran against `rebuild_bundle.build()`, a
+reconstruction that infers signal dates from `weights.parquet` by assuming a
+view lives `horizon_days + 1` sessions. Against the real DB feed at an
+identical config:
+
+| | reconstructed | **real feed** | canonical CLI replay |
+|---|---|---|---|
+| CAGR | 8.82% | **5.75%** | 5.80% |
+| Sharpe | 0.74 | **0.63** | 0.66 |
+| turnover | 1246% | **361%** | **361%** |
+
+The reconstruction **traded 3.5× more than reality**. CAGR was close enough to
+pass a casual check; turnover was off threefold, and §5h's headline finding
+("zero of 2,304 configs pass the turnover cap") was that artifact announcing
+itself. It was reported as a property of the strategy instead of read as a
+broken harness. **Validate a reconstruction on the quantity it had to guess at
+— here, signal timing — not on the quantity of interest.**
+
+On the real feed 401 of 720 configs (55.7%) pass the cap; median turnover 381%.
+
+### Real-feed ground truth (2016-07-25 → 2026-07-31, 2,519 sessions)
+
+| | ending | CAGR | Sharpe |
+|---|---|---|---|
+| shipped (v12 g1 r5) | $17,488 | 5.21% | 0.63 |
+| **SPY buy & hold** | **$40,479** | **15.02%** | **0.84** |
+
+The strategy returns less than half of buy-and-hold and is worse
+risk-adjusted. Decomposed against SPY: **alpha +1.41%/yr, beta 0.30**.
+`5.75% ≈ 0.30 × 15% + 1.4%` — a third of the market, plus a little alpha.
+
+2020 is the wound: −11.4% against SPY's +18.3%, the governor flat through the
+recovery. 2022 is the justification: −1.1% against −18.2%. One good year of
+protection bought at roughly ten points a year of permanent underexposure.
+
+### More signals were tested. They lose money.
+
+`filter_tradeable` cuts 47 admitted cells to 18 — 43.7 signals/day down to
+5.9. Running the full 47:
+
+| config | 18 cells | 47 cells | alpha |
+|---|---|---|---|
+| shipped | 5.75% | 5.43% | +1.41% → +1.33% |
+| breadth | 6.95% | 5.88% | +1.78% → +0.92% |
+| directional | 4.57% | **1.53%** | +0.10% → **−2.55%** |
+| hot | 4.80% | **0.77%** | +0.14% → **−3.55%** |
+
+The 29 filtered cells carry negative alpha, and it worsens with risk taken.
+The hedge filter is load-bearing, not merely conservative.
+
+### The 40-day rebalance result is overfitting — caught by a sensitivity test
+
+The 720-config sweep put `rebalance_days` first by a wide margin (median CAGR
+8.70% at 40d vs 4.69–5.65% elsewhere; **all top 12 configs were r40**), with
+the winner at 11.82% CAGR, Sharpe 0.94, alpha 6.04% — apparently beating SPY
+risk-adjusted. The tempting story: rebalancing must match the 40–120 day
+signal horizons.
+
+Two tests killed it.
+
+**Sweep the period widely** — a mechanism gives a smooth curve:
+
+| 20d | 30d | 40d | 50d | 60d | 80d | 100d | 120d |
+|---|---|---|---|---|---|---|---|
+| 6.34% | 5.41% | **11.82%** | 8.78% | **4.82%** | 11.08% | 7.00% | 8.17% |
+
+Peaks at 40 and 80 with a trough at 60 between them. Alpha runs 6.04% → 0.09%
+→ 5.35%. Not a mechanism.
+
+**Perturb by one day** — the decisive one:
+
+| 36d | 37d | 38d | 39d | **40d** | 41d | 42d | 43d | 44d |
+|---|---|---|---|---|---|---|---|---|
+| 6.47% | 9.55% | 10.21% | 9.26% | **11.82%** | 8.87% | 9.43% | 9.07% | 8.11% |
+
+**A ±4-day change swings CAGR 5.4 points (sd 1.45%).** With ~70 rebalance
+events in a decade, which days the grid lands on relative to signal arrivals
+is arbitrary. 40 is the maximum of a noisy sample, exactly what PBO ≈ 0.45 was
+warning about.
+
+### What survives
+
+Averaging over the phase rather than picking its peak:
+
+- slow rebalance (36–44d): mean CAGR **9.20%**, mean alpha **~3.7%**
+- fast rebalance (5–20d): mean CAGR **~6.3%**, alpha ~1.3–1.7%
+
+**Slow rebalancing is worth ~+3 points and roughly triples alpha** — the
+effect clears the ±1.5% phase noise even though any single period choice does
+not. Quote it as **9.2% ± 1.5%, alpha ~3.7%, beta ~0.37**, never as 11.82%.
+
+This also corrects §5h's "only two axes matter" claim: `rebalance_days` looked
+like noise there only because that grid stopped at 20 days.
+
+### Revised menu
+
+With alpha ~3.7% rather than 1.4%:
+
+| | return | cost |
+|---|---|---|
+| today (fast rebalance) | 5.2% | — |
+| slow rebalance | ~9% | none — turnover *falls* 545% → ~300% |
+| slow + beta → 1.0 | **~19%** | market drawdowns (−18% in 2022) |
+| slow + beta → 1.7 | **~30%** | ~−31% years, financing on the levered part |
+
+30%/yr needs beta ≈ 1.7, not the 2.0 implied before the alpha was measured
+correctly. It remains a leverage decision, not a research result.
+
+---
+
+## 5j. Working backwards from 30% — the measured price (2026-08-01)
+
+Computed as a **returns overlay** rather than by re-running the simulator per
+combination: the strategy series is combined with `w_spy` of index exposure and
+levered by `L`, with financing charged on the borrowed portion at 6%. Exact for
+an overlay; it does not capture the optimizer re-solving under a different gross
+cap, so any row worth keeping must be re-run through the full simulator.
+
+Baseline strategy: slow rebalance, breadth cap lifted, realized gross 0.89.
+Overlay at `w_spy = 0.6`: **µ 21.33%, vol 20.48%, Sharpe 1.04.**
+
+### Four safety regimes, at matched ~30% return
+
+| regime | best maxDD at ~30% | Sharpe | worst year |
+|---|---|---|---|
+| static leverage | **cannot reach 30%** | — | — |
+| **voltarget** | **49.4%** | 0.73 | −33.1% |
+| trend filter only | 62.0% | 0.66 | −39.1% |
+| voltarget + trend | 51.9% | 0.65 | −31.1% |
+
+Volatility targeting — scale to constant vol using a **trailing** EWMA, lever up
+when calm and cut when turbulent — is the only regime that reaches 30% at a
+drawdown below 50%. The 200-day trend filter *alone* is the worst of the four,
+consistent with the earlier crash-prediction finding that trend alarms were
+followed by above-average returns.
+
+### The full trade-off curve
+
+| target | regime | +SPY | lev | CAGR | maxDD | worst yr | Sharpe |
+|---|---|---|---|---|---|---|---|
+| 12% | trend | 0.0 | 1.0 | 10.5% | **16.6%** | −5.9% | **0.97** |
+| 15% | static | 0.0 | 1.2 | 13.7% | 22.1% | −8.2% | 0.91 |
+| 18% | both | 1.5 | 1.0 | 18.9% | 30.0% | −17.8% | 0.77 |
+| 25% | voltarget | 0.6 | 1.1 | 24.4% | 36.3% | −23.0% | 0.84 |
+| **30%** | voltarget | 0.6 | 1.5 | 28.8% | **49.4%** | −33.1% | 0.73 |
+
+Recovering from −49.4% requires **+98%**. That is the honest price of 30%/yr,
+and it is worse than the ~40% estimated before measuring.
+
+### There is a hard ceiling at ~33%, and it is volatility drag
+
+Raising the exposure cap from 4× to 12× to check whether the ceiling was an
+artifact of the cap. It is not:
+
+| leverage | CAGR | vol | maxDD |
+|---|---|---|---|
+| 1.0 | 22.0% | 26.8% | **32.7%** |
+| 1.5 | 27.4% | 40.2% | 49.4% |
+| 2.0 | 31.2% | 53.5% | 63.0% |
+| **2.5** | **33.0%** | 66.6% | 73.8% |
+| 3.0 | 32.7% | 79.8% | 81.9% |
+| 4.0 | 23.9% | 105.6% | 92.4% |
+| 6.0 | **−13.1%** | 151.5% | 99.8% |
+
+**CAGR peaks at 2.5× and then falls, turning negative by 6×.** Geometric growth
+is `µ − σ²/2`; past the peak the variance term grows faster than the mean.
+This is arithmetic, not a tuning failure — no configuration escapes it.
+
+Kelly confirms the shape: optimal leverage `µ/σ² = 5.09×`, theoretical max
+growth `SR²/2 = 54.2%` — but full Kelly runs a 98.5% drawdown, so the
+attainable region is far below it.
+
+### The best risk-adjusted point on the whole surface
+
+**22.0% CAGR at 32.7% maxDD, Sharpe 1.04**, no leverage multiplier (total
+exposure 1.49× from the index overlay, financing included). That beats SPY on
+**both** axes — 15.02% CAGR and Sharpe 0.84 — and it is the only point on the
+frontier that does.
+
+The implication for the 30% goal: getting there safely requires a higher
+Sharpe, not more leverage. At Sharpe 1.04 the attainable-with-tolerable-drawdown
+region tops out near 22–25%. At Sharpe 1.5, 30% would sit well below Kelly and
+carry roughly 30% drawdowns instead of 50%. **Sharpe is the binding constraint
+on a safe 30%, and the only untested source of it is graph propagation.**

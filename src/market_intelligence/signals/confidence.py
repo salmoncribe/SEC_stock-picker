@@ -27,6 +27,8 @@ class ConfidenceInputs:
     times_asserted: int             # independent filings asserting the edge (0 for self)
     extraction_confidence: float | None  # extractor's own 0..1 confidence
     has_track_record: bool          # False for gap alerts until the ledger matures
+    corroborating_people: int = 1   # distinct insiders transacting this ticker's way
+                                     # within the trailing corroboration window, incl. this one
 
 
 def shrunk_hit_rate(hit_rate: float | None, n: int) -> float:
@@ -48,7 +50,19 @@ def score(inputs: ConfidenceInputs) -> int:
     edge_bonus = min(max(inputs.times_asserted or 0, 0), 5) * 1.0
     extract_bonus = min(1.0, max(0.0, inputs.extraction_confidence or 0.0)) * 5.0
 
-    value = base + edge_bonus + extract_bonus
+    # A second independent insider transacting the same qualifying way on the
+    # same ticker within the trailing window is at least as strong a signal
+    # as one alone -- measured 120d edge 11.5%/21.2% (search/confirm) for
+    # exactly 2, vs 7.9%/21.0% for exactly 1. A third or more is NOT
+    # stronger: this is precisely where the old cluster-buy detector's flaw
+    # lived -- it looked strong in-sample (search 9.2%) but collapsed
+    # out-of-sample (confirm 2.1%, failing year-robustness). So the bonus
+    # applies only at exactly 2 corroborators; 1 and 3+ get none -- a crowd
+    # is a caution, not confirmation, and does not get penalized either,
+    # since the underlying signal can still be real on its own.
+    corroboration_bonus = 3.0 if inputs.corroborating_people == 2 else 0.0
+
+    value = base + edge_bonus + extract_bonus + corroboration_bonus
     if not inputs.has_track_record:
         value = min(value, 50.0)
     return int(max(0.0, min(100.0, round(value))))

@@ -439,8 +439,18 @@ def test_a_reused_ticker_does_not_borrow_another_company_s_edges(
     assert [alert.ticker for alert in alerts] == []
 
 
-def test_the_filer_s_own_edges_still_fire(tmp_config: Config) -> None:
-    """The positive control: matching CIKs still produce the target alert."""
+def test_the_filer_s_own_edges_still_fire(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The positive control: matching CIKs still produce the target alert.
+
+    This test is about the CIK-based join, not about whether a 'customer'
+    edge is business-approved for production (it isn't, as of 2026-08-04 --
+    see signals.approved_signals). Monkeypatching is_approved here isolates
+    the join-correctness question this test exists to pin from that separate,
+    unrelated concern.
+    """
+    monkeypatch.setattr(briefing_builder, "is_approved", lambda *args: True)
     _seed_alert_world(tmp_config, edge_source_cik="0000002488")
 
     with database.connection(tmp_config.paths.database_path) as con:

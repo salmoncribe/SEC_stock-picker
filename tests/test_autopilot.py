@@ -28,6 +28,17 @@ from market_intelligence.storage import duckdb as duckdb_store
 AS_OF = date(2026, 7, 22)
 
 
+@pytest.fixture(autouse=True)
+def _bypass_signal_approval_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This file tests orchestration mechanics (dedup, delivery stamping,
+    confidence gating, run-status handling) -- none of it is about which
+    specific cells are business-approved for production, which is its own
+    concern covered by tests/test_event_alert_approval.py. Bypassing the
+    allowlist here keeps this file's fixtures (arbitrary subtype/horizon
+    combinations) decoupled from that separate, evolving list."""
+    monkeypatch.setattr(briefing_builder, "is_approved", lambda *args: True)
+
+
 def _seed_status(
     config: Config,
     *,

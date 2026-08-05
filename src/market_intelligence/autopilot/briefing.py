@@ -21,6 +21,7 @@ from market_intelligence.autopilot.types import (
     EventAlert,
     SignalChange,
 )
+from market_intelligence.signals.approved_signals import is_approved
 from market_intelligence.signals.promotion import LadderStatus
 
 if TYPE_CHECKING:
@@ -136,10 +137,16 @@ def event_alerts(
     as_of: date,
     lookback_days: int,
 ) -> list[EventAlert]:
-    """Predictions fired by recent events through currently-active cells.
+    """Predictions fired by recent events through currently-active, approved cells.
 
     An event that became public within the lookback window yields one alert per
-    matching active cell. Self-edge cells predict the event ticker itself.
+    matching active cell -- but only if the cell also clears
+    :func:`~market_intelligence.signals.approved_signals.is_approved`. The
+    ladder's ACTIVE status is a mechanical threshold test; the allowlist is a
+    second, human-reviewed gate on top of it, because this feeds real trades
+    (eventually an automated system) and a threshold clearing by chance is not
+    the same as a signal someone has actually looked at. See that module's
+    docstring for why. Self-edge cells predict the event ticker itself.
     Propagation cells join through ``company_edges`` so a source event can fire
     a plan for a connected target ticker.
 
@@ -193,6 +200,8 @@ def event_alerts(
         n_clusters,
         extraction_confidence,
     ) in self_rows:
+        if not is_approved(str(etype), subtype, SELF_EDGE, int(horizon)):
+            continue
         hit_pct = f"{float(hit_rate):.1%}" if hit_rate is not None else "n/a"
         alerts.append(
             EventAlert(
@@ -258,6 +267,8 @@ def event_alerts(
         times_asserted,
         edge_extraction_confidence,
     ) in propagation_rows:
+        if not is_approved(str(etype), subtype, str(edge_type), int(horizon)):
+            continue
         hit_pct = f"{float(hit_rate):.1%}" if hit_rate is not None else "n/a"
         assertions = int(times_asserted) if times_asserted is not None else 0
         alerts.append(

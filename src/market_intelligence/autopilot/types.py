@@ -71,6 +71,13 @@ class EventAlert:
     The alert also carries the identifiers and stats the trade-alert layer
     needs: ``event_id`` is the ledger's dedup key, and ``hit_rate``,
     ``n_clusters``, ``extraction_confidence`` feed its confidence score.
+
+    ``corroborating_people`` is how many distinct insiders (by owner CIK,
+    including this one) transacted this ticker's own qualifying way within
+    the trailing corroboration window -- exactly 2 measurably strengthens the
+    signal, 3+ does not (see ``signals.confidence``). Defaults to 1 (no known
+    corroboration) so callers that haven't computed it yet get no bonus
+    rather than a silently wrong one.
     """
 
     ticker: str
@@ -90,6 +97,7 @@ class EventAlert:
     source_ticker: str | None = None
     times_asserted: int = 0
     edge_extraction_confidence: float | None = None
+    corroborating_people: int = 1
 
 
 @dataclass(frozen=True)

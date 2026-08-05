@@ -160,6 +160,7 @@ def build_records(
                     times_asserted=alert.times_asserted,
                     extraction_confidence=_combined_extraction_confidence(alert),
                     has_track_record=True,
+                    corroborating_people=alert.corroborating_people,
                 )
             )
             evidence = {
@@ -177,6 +178,7 @@ def build_records(
                 "target_ticker": alert.ticker,
                 "times_asserted": alert.times_asserted,
                 "edge_extraction_confidence": alert.edge_extraction_confidence,
+                "corroborating_people": alert.corroborating_people,
             }
             edge_id = alert.edge_id or "self"
             records.append(

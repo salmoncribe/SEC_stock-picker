@@ -73,3 +73,25 @@ class TestScore:
     def test_none_hit_rate_treated_as_no_signal(self):
         s = score(_inputs(hit_rate=None))
         assert 0 <= s <= 60
+
+
+class TestCorroboration:
+    """A second independent insider on the same ticker is at least as good as
+    one alone; a third or more is not better -- measured this way on purpose,
+    see the module comment. These pin the shape (2 > 1, 2 >= 3+, 1 == 3+),
+    not the exact bonus size."""
+
+    def test_two_corroborators_scores_above_one(self):
+        assert score(_inputs(corroborating_people=2)) > score(_inputs(corroborating_people=1))
+
+    def test_three_or_more_gets_no_bonus_over_one(self):
+        assert score(_inputs(corroborating_people=3)) == score(_inputs(corroborating_people=1))
+        assert score(_inputs(corroborating_people=7)) == score(_inputs(corroborating_people=1))
+
+    def test_three_or_more_scores_below_two(self):
+        assert score(_inputs(corroborating_people=3)) < score(_inputs(corroborating_people=2))
+
+    def test_default_is_the_no_bonus_case(self):
+        # Callers that don't yet know how many corroborators there are must
+        # not silently get a bonus they didn't earn.
+        assert score(_inputs()) == score(_inputs(corroborating_people=1))

@@ -152,12 +152,45 @@ Exposes exactly one query function:
 
 ```python
 def universe_on(as_of: date) -> set[str]:
-    """Tickers listed on as_of. Excludes anything with no membership record."""
+    """CIKs both listed AND priced on as_of.
+
+    Listed-but-unpriced names are excluded from the tradeable universe and
+    counted into the survivorship-hole report (§4.4). The gap between
+    `listed` and `listed AND priced` IS the hole.
+    """
 ```
 
 **Absence is exclusion, never assumption.** A ticker with no membership row on
 date `D` is not in the universe on `D`. This is the opposite of the current
 behaviour, where absence from the delisting record silently implies "still alive."
+
+**Identity is CIK, not ticker.** Tickers are reused and reassigned (a merged
+company's ticker can be issued to an unrelated filer). All joins, all membership,
+and the DEV/VAULT split key on CIK; ticker is carried as a display attribute
+resolved as-of.
+
+### 4.2.1 Form 25 effective date
+
+Form 25 is filed *before* delisting takes effect — typically 10 days under
+Rule 12d2-2. `last_listed_date` is therefore `filing_date + 10 calendar days`,
+not the filing date, and is clamped to the last observed price date where one
+exists. Using the filing date directly would drop a name while it was still
+trading, silently deleting its final (usually very negative) returns.
+
+### 4.2.2 Delisting return
+
+When a name leaves the universe mid-month, the portfolio must earn *something*.
+The convention, fixed in advance:
+
+| case | return applied |
+|---|---|
+| price data exists through delisting | actual realised return |
+| exchange-initiated (`25-NSE`), no price | **−30%** (Shumway 1997) |
+| voluntary (`25`), no price — typically M&A | **0%** |
+
+Silently dropping the name instead — which is the current behaviour — is
+equivalent to assuming a 0% return for bankruptcies, and inflates the short leg's
+apparent weakness precisely where it should be strongest.
 
 ### 4.3 Backfill of existing columns
 
@@ -178,7 +211,13 @@ decision is explicitly deferred until this number exists.
 Until the hole is closed, the trustworthy universe is S&P 500 point-in-time
 membership from the existing `index_constituents` table (900 rows, 380 with
 `removed_date`, verified real: Alcoa removed 2016-11-01, AAL removed 2024-09-23).
-~500 names supports **quintile** sorts (100/bucket), not deciles.
+
+~500 names yields 50 per bucket at deciles, which clears the ≥20 minimum in
+§6.1, so **deciles are used wherever the minimum is met** and the sort coarsens
+to quintiles only when it is not. Bucket granularity is chosen by the breadth
+rule, never fixed per universe — but it is recorded per month alongside the
+result, because a factor whose spread appears only when the sort coarsens is an
+artifact of bucket choice.
 
 Every evaluation result carries a `survivorship` label:
 
@@ -267,6 +306,22 @@ Share counts are as-reported and not split-adjusted. The split factor is derived
 from the existing panel as the ratio `close / adj_close`, whose discrete jumps
 identify split dates. Share-count factors compare split-adjusted counts only.
 
+### 5.5.1 Market capitalisation
+
+Required for value-weighting (§6.1) and as the `insider_intensity` denominator.
+Not stored by any source; derived as:
+
+```
+mktcap(cik, t) = shares_outstanding_as_of(cik, t) × close(ticker, t)
+```
+
+where `shares_outstanding_as_of` uses the §5.3 accessor, so the share count is
+the one that had actually been *filed* by `t`. Using a later share count — the
+natural mistake — imports post-buyback or post-issuance information.
+
+Market cap is therefore stale by up to one quarter by construction. That is
+correct: it is what was knowable.
+
 ### 5.6 Factor slate (pre-registered)
 
 Committed to `docs/preregistration/2026-08-09-factor-slate.md` **before any
@@ -275,7 +330,7 @@ result is computed**. `N_trials` for the Deflated Sharpe is read from that file.
 | factor | construction | dir | literature |
 |---|---|---|---|
 | `net_issuance` | YoY Δ split-adjusted shares outstanding | − | Pontiff & Woodgate (2008); Daniel & Titman (2006) |
-| `pead` | standardised unexpected earnings vs seasonal random walk | + | Ball & Brown (1968) |
+| `pead` | standardised unexpected earnings vs seasonal random walk (see §5.6.1) | + | Ball & Brown (1968) |
 | `accruals` | (NetIncome − CFO) / average assets | − | Sloan (1996) |
 | `profitability` | gross profit / assets | + | Novy-Marx (2013) |
 | `asset_growth` | YoY Δ total assets | − | Cooper, Gulen & Schill (2008) |
@@ -286,7 +341,29 @@ It doubles as a harness sanity check: its approximate expected behaviour is know
 from prior work, so a wildly different result indicates a harness bug rather than
 a discovery.
 
-Interface, one small module per factor:
+### 5.6.1 `pead` announcement timing
+
+PEAD is drift measured from the **earnings announcement**, not from the 10-Q
+filing. The press release lands as an 8-K Item 2.02 and the 10-Q typically
+follows days to weeks later. Keying the factor on the 10-Q `filed` date would
+start the clock after part of the drift has already occurred and would
+systematically understate the effect.
+
+Announcement date resolution, in order:
+
+1. 8-K Item 2.02 event date — 23,811 available in `events`, but only across
+   626 CIKs
+2. otherwise the earliest `filed_date` of any XBRL EPS fact for that period
+
+The value (SUE) always comes from XBRL; only the *timing* uses the 8-K. Because
+source (1) covers a small minority of the universe, the coverage split is
+reported with the factor's result — if `pead` performs materially differently on
+the 8-K-covered subset than on the fallback subset, the difference is a timing
+artifact, not an edge.
+
+### 5.6.2 Factor interface
+
+One small module per factor:
 
 ```python
 class Factor(Protocol):
@@ -309,6 +386,23 @@ where breadth requires it), record the long-short spread as one monthly return.
   never a silently-averaged partial sort.
 - Both equal-weighted and value-weighted spreads are reported. A factor that
   works only equal-weighted is a micro-cap illiquidity artifact.
+
+**Forward returns compound; they are never summed.**
+
+```
+r_fwd = ∏(1 + r_daily) − 1        NOT  Σ r_daily
+```
+
+This is stated explicitly because the existing codebase got it wrong once:
+`forward_abnormal_return` is a cumulative *sum* of daily abnormal returns, and
+`docs/specs/2026-07-29-backtest-findings.md` Finding 2 measured the resulting
+overstatement at roughly ½σ²H — approximately 2.5% over 20 days for the volatile
+names in question, the same order of magnitude as the entire claimed edge.
+
+The existing `daily_returns.abnormal_return` column is **not** reused for factor
+evaluation. Spreads are computed from `total_return` compounded; the long-short
+construction removes market exposure by differencing, so no alpha/beta model is
+needed and the unhedgeable-alpha problem from Finding 1 does not arise.
 
 ### 6.2 `cpcv.py`
 
@@ -353,11 +447,15 @@ DSR = Z[ (SR − SR₀)·√(T−1) / √(1 − γ₃·SR + ((γ₄−1)/4)·SR�
 ### 6.5 `vault.py`
 
 ```python
-def split_of(ticker: str) -> Literal["dev", "vault"]:
-    return "dev" if int(sha256(ticker.encode()).hexdigest(), 16) % 100 < 70 else "vault"
+def split_of(cik: str) -> Literal["dev", "vault"]:
+    return "dev" if int(sha256(cik.encode()).hexdigest(), 16) % 100 < 70 else "vault"
 ```
 
 Deterministic, permanent, no state to lose or corrupt.
+
+**Keyed on CIK, not ticker**, so a company changing ticker cannot migrate between
+DEV and VAULT. A ticker-keyed split would silently leak vault names into dev
+every time an issuer renamed.
 
 **Guard.** Every evaluation run records whether it touched VAULT tickers, and
 VAULT reads append to a git-tracked log at `docs/preregistration/vault-reads.log`

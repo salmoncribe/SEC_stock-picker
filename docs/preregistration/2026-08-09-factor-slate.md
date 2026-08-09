@@ -48,7 +48,12 @@ number. `dir` is the hypothesised sign: `+` = high values predict high returns.
 
 - **Construction:** standardised unexpected earnings. `SUE = (EPS_q − EPS_{q−4}) /
   σ(EPS_q − EPS_{q−4})`, σ estimated over the trailing 8 available quarters.
-- **Source:** `us-gaap:EarningsPerShareDiluted`, fallback `EarningsPerShareBasic`.
+- **Source (value):** `us-gaap:EarningsPerShareDiluted`, fallback
+  `EarningsPerShareBasic`.
+- **Source (announcement timing):** 8-K Item 2.02 event date where available
+  (23,811 events, 626 CIKs); otherwise earliest `filed_date` of the EPS fact.
+  Drift is measured from the announcement, not the 10-Q. Coverage split is
+  reported with the result.
 - **Hypothesis:** positive earnings surprises are underreacted to and drift.
 - **Prior:** Ball & Brown (1968).
 
@@ -95,10 +100,16 @@ number. `dir` is the hypothesised sign: `+` = high values predict high returns.
 - **Winsorisation:** factor values at 1% / 99%, cross-sectionally, before ranking.
 - **Weighting:** equal-weighted **and** value-weighted, both reported. A factor
   surviving only equal-weighted is classified as a micro-cap artifact, not an edge.
-- **Return:** long top decile, short bottom decile, one month forward.
-- **Universe:** `universe_on(t)`, with the `survivorship` label attached
-  (`clean` / `bounded` / `biased`).
-- **Splits:** DEV = `sha256(ticker) % 100 < 70`; VAULT = remainder.
+- **Return:** long top bucket, short bottom bucket, one month forward.
+  **Compounded** — `∏(1+r) − 1`, never summed. Computed from
+  `daily_returns.total_return`; the existing `abnormal_return` column is not used.
+- **Delisting return:** actual where priced; **−30%** for exchange-initiated
+  (`25-NSE`) with no price (Shumway 1997); **0%** for voluntary (`25`, typically
+  M&A). Names are never silently dropped.
+- **Universe:** `universe_on(t)` = listed AND priced, with the `survivorship`
+  label attached (`clean` / `bounded` / `biased`).
+- **Splits:** DEV = `sha256(cik) % 100 < 70`; VAULT = remainder. Keyed on CIK so
+  ticker changes cannot migrate a company across the boundary.
 - **Statistics reported per factor, always together:**
   1. mean monthly spread and annualised Sharpe
   2. Fama-MacBeth t-statistic, Newey-West corrected

@@ -126,14 +126,67 @@ daily_prices / daily_returns (existing) ─────────────�
 
 ### 4.1 `delistings.py`
 
-Parses the EDGAR quarterly full-index (`https://www.sec.gov/Archives/edgar/full-index/{year}/QTR{q}/form.idx`)
-for forms `25`, `25-NSE`, `25/A`, `25-NSE/A`. Each row yields CIK, company name,
-form, filing date, accession. Verified available: 2020 Q1 returns HTTP 200,
-50.7 MB, containing 404 `25-NSE` + 56 `25` + 3 `25/A` + 2 `25-NSE/A`.
+Source: the EDGAR quarterly full-index. **Use `master.idx`, which is
+pipe-delimited (`CIK|Company Name|Form Type|Date Filed|Filename`), not
+`form.idx`.** `form.idx` is nominally fixed-width but its header offsets do not
+hold: company names longer than 62 characters push every subsequent field right.
+Verified failure — `BRAZILIAN DISTRIBUTION CO COMPANHIA BRASILEIRA DE DISTR CBD`
+shifts the CIK field so a header-offset parse returns `'BD   1038572'` as the
+CIK. `master.idx` for 2020 Q1: HTTP 200, 29.1 MB.
 
-Form 25 is filed by the issuer, 25-NSE by the exchange. 25-NSE is the stronger
-delisting signal (exchange-initiated); both are recorded with the form preserved
-so downstream code can distinguish voluntary from involuntary.
+#### 4.1.1 Form 25 and Form 15 are NOT company-death signals
+
+This was tested against real data before being relied on, and the naive rule
+fails completely.
+
+2020 Q1 Form 25 filers matched to companies in the panel:
+
+| | count |
+|---|---|
+| matched to a company in our universe | 50 |
+| **stopped trading near the Form 25 date** | **0** |
+| still trading six months later | 29 |
+| no price data at all | 21 |
+
+Repeating across the whole deregistration family gives the same answer — zero
+cessations within 60 days for `25`, `25-NSE`, and `15-*` alike. Individual cases
+show why:
+
+| ticker | company | form | filed | status today |
+|---|---|---|---|---|
+| `DOV` | Dover Corp | `15-12B` | 2020-01-13 | trading |
+| `PLD` | Prologis | `15-12B` | 2020-01-16 | trading |
+| `OI` | O-I Glass | `15-12B` | 2020-01-06 | trading |
+
+**Both forms deregister a class of securities or a registrant entity, not a
+company.** Holdco reorganizations (O-I Glass reorganizing above Owens-Illinois),
+merger absorptions (Prologis/Liberty Property Trust), warrant and unit
+expirations, and retired debt series all generate them from healthy issuers. In
+2020 Q1, 45 of 178 Form 25 filers filed more than once in the same quarter —
+one filed four times — which is the signature of per-class filing.
+
+Implementing the original rule would have **deleted 29 live companies** from the
+universe in a single quarter.
+
+#### 4.1.2 The mechanism that does work
+
+A company stopped being a tradeable US-listed equity when **it stopped filing
+periodic reports and never resumed**:
+
+```
+presumed_delisted(cik) ⟺ no 10-K or 10-Q filed in the 18 months
+                          following its last periodic filing,
+                          and that gap extends to the present
+```
+
+`last_listed_date` = the last periodic filing date, corroborated against
+price-series termination where prices exist. Form 25 / 25-NSE / 15-* are
+retained as *supporting evidence* recorded on the row (they narrow the date and
+distinguish exchange-initiated from voluntary), but **never as the trigger**.
+
+Filing history comes from `filings` for the 627 CIKs already collected, and from
+the SEC submissions API (`https://data.sec.gov/submissions/CIK{cik10}.json`,
+verified HTTP 200) for the rest.
 
 ### 4.2 `membership.py`
 
@@ -516,15 +569,23 @@ refactors cannot silently change results.
 
 ## 9. Build order
 
-1. `universe/` — delisting parse, membership table, coverage report, column backfill
-2. `evaluation/` — sorts, CPCV, Fama-MacBeth, DSR, vault + guard, **both canaries**
-3. `fundamentals/` — companyfacts ingest, as-of accessor, split adjustment
-4. `factors/` — six modules against the pre-registered slate
-5. Run: S&P 500 point-in-time (`survivorship: clean`) → full panel (`biased`), reported side by side
+1. **`evaluation/`** — sorts, CPCV, Fama-MacBeth, DSR, vault + guard, **both canaries**
+2. `fundamentals/` — companyfacts ingest, as-of accessor, split adjustment
+3. `factors/` — six modules against the pre-registered slate
+4. Run on the S&P 500 point-in-time universe (`survivorship: clean`)
+5. `universe/` — filing-cessation delisting detection, membership table, hole
+   report, column backfill; then re-run step 4 on the expanded universe
 
-Order is deliberate: the judge is built and self-tested **before** the evidence,
-so no factor result is ever produced by an unvalidated harness. Step 2 completing
-with both canaries passing is the gate for steps 3–5.
+**Order is deliberate: the judge is built and self-tested before any evidence
+exists**, so no factor result is ever produced by an unvalidated harness. Step 1
+completing with both canaries passing is the hard gate for everything after it.
+
+`universe/` moved from first to last after §4.1.1: because EDGAR carries no
+prices, reconstructing the delisted set cannot by itself put those companies into
+a backtest — it can only *measure* the hole and inform the paid-feed decision.
+Meanwhile the trustworthy interim universe already exists in `index_constituents`
+and needs no new code. So universe work is an expansion and a diagnostic, not a
+blocker, and sequencing it first would have delayed every result for no gain.
 
 ---
 

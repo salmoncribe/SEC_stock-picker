@@ -129,18 +129,33 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
             summary_notes TEXT,
             graded_at TIMESTAMPTZ
         );
+
+        CREATE TABLE IF NOT EXISTS filing_transactions (
+            transaction_id TEXT PRIMARY KEY,
+            filing_id TEXT,
+            accession_number TEXT NOT NULL,
+            buyer_ticker TEXT,
+            seller_target_name TEXT NOT NULL,
+            transaction_type TEXT,
+            purchase_price_usd DOUBLE,
+            consideration_type TEXT,
+            context_summary TEXT,
+            extracted_at TIMESTAMPTZ,
+            UNIQUE (accession_number, seller_target_name)
+        );
     """)
 
 
 def get_table_counts(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
     counts: dict[str, int] = {}
     tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
-    for t in ["companies", "filings", "filing_documents", "sync_log", "filing_sections", "filing_metrics", "filing_grades"]:
+    for t in ["companies", "filings", "filing_documents", "sync_log", "filing_sections", "filing_metrics", "filing_grades", "filing_transactions"]:
         if t in tables:
             counts[t] = con.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0]
         else:
             counts[t] = 0
     return counts
+
 
 
 def upsert_companies(con: duckdb.DuckDBPyConnection, rows: list[tuple[str, str, str]]) -> int:
@@ -303,10 +318,36 @@ def get_ungraded_filings(con: duckdb.DuckDBPyConnection, limit: int = 50) -> lis
     ]
 
 
+def upsert_transactions(con: duckdb.DuckDBPyConnection, rows: list[tuple[str, str, str, str, float | None, str, str]]) -> int:
+    """Upsert filing transactions: (accession_number, buyer_ticker, seller_target_name, transaction_type, purchase_price_usd, consideration_type, context_summary)."""
+    if not rows:
+        return 0
+    now = datetime.now(timezone.utc)
+    data = []
+    for r in rows:
+        acc, ticker, target, deal_type, price, consideration, context = r
+        t_id = hash_id("txn", acc, target)
+        filing_id = hash_id("filing", acc)
+        data.append((t_id, filing_id, acc, ticker, target, deal_type, price, consideration, context, now))
+
+    con.executemany("""
+        INSERT INTO filing_transactions (transaction_id, filing_id, accession_number, buyer_ticker, seller_target_name, transaction_type, purchase_price_usd, consideration_type, context_summary, extracted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (accession_number, seller_target_name) DO UPDATE SET
+            transaction_type = EXCLUDED.transaction_type,
+            purchase_price_usd = EXCLUDED.purchase_price_usd,
+            consideration_type = EXCLUDED.consideration_type,
+            context_summary = EXCLUDED.context_summary,
+            extracted_at = EXCLUDED.extracted_at
+    """, data)
+    return len(rows)
+
+
 def log_sync(con: duckdb.DuckDBPyConnection, sync_id: str, action: str, items_synced: int, status: str, message: str = "") -> None:
     now = datetime.now(timezone.utc)
     con.execute("""
         INSERT INTO sync_log (id, action, items_synced, status, message, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
         """, [sync_id, action, items_synced, status, message, now])
+
 

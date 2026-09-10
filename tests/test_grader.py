@@ -105,3 +105,20 @@ def test_financial_extractor():
     assert res.get("eps_diluted") == 1.25
     assert "retire from the Board" in res.get("executive_event_summary", "")
 
+
+def test_transaction_extractor():
+    from sec_service.transaction_extractor import TransactionExtractor
+    txn_ext = TransactionExtractor()
+    sample_text = """
+    On July 12, 2026, the Company entered into a definitive agreement to acquire TechSystems Corp for $ 1.5 billion in cash.
+    Additionally, the Company acquired DataCloud Inc for $ 350 million.
+    """
+    txns = txn_ext.extract_transactions(sample_text, {}, ticker="MSFT")
+    assert len(txns) >= 1
+    t0 = txns[0]
+    assert t0["buyer_ticker"] == "MSFT"
+    assert "TechSystems" in t0["seller_target_name"]
+    assert t0["purchase_price_usd"] == 1_500_000_000.0
+    assert t0["consideration_type"] == "Cash"
+
+

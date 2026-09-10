@@ -97,7 +97,9 @@ class SECDownloaderService:
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         file_path = dest_dir / primary_doc
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_bytes(doc_bytes)
+
 
         # Log in DB
         database.upsert_document(

@@ -102,17 +102,41 @@ def inspect_filing(config: Config, target: str) -> None:
                 val = f"{m[1]:,.2f}" if isinstance(m[1], float) else (m[2] or str(m[1]))
                 print(f"    - {m[0]:<28}: {val}")
 
-            # Print section list
-            sections = con.execute("""
-                SELECT section_name, word_count, left(clean_text, 120)
-                FROM filing_sections
+            # Print transactions
+            txns = con.execute("""
+                SELECT seller_target_name, transaction_type, purchase_price_usd, consideration_type, context_summary
+                FROM filing_transactions
                 WHERE accession_number = ?
             """, [acc]).fetchall()
-            print("\n  [Extracted Document Sections]:")
-            for s in sections:
-                sample = (s[2] or "").replace("\n", " ")
-                print(f"    - {s[0]} ({s[1]} words): {sample}...")
+            if txns:
+                print("\n  [Extracted Corporate Purchases & M&A Deals]:")
+                for t in txns:
+                    p_str = f"${t[2]:,.0f}" if t[2] else "Unspecified Amount"
+                    print(f"    - Purchased/Acquired: {t[0]} ({t[1]}, {p_str}, {t[3]})")
+                    print(f"      Details: {t[4][:140]}...")
             print("\n")
+
+
+def print_transactions(config: Config) -> None:
+    with database.connection(config.db_path, read_only=True) as con:
+        rows = con.execute("""
+            SELECT buyer_ticker, seller_target_name, transaction_type, purchase_price_usd, consideration_type, accession_number, context_summary
+            FROM filing_transactions
+            ORDER BY purchase_price_usd DESC NULLS LAST
+            LIMIT 50
+        """).fetchall()
+
+    print("\n=== Corporate B2B Purchases & M&A Deals ===")
+    if not rows:
+        print("No corporate purchase transactions detected yet.")
+    else:
+        print(f"{'Buyer':<8} {'Seller/Target':<30} {'Deal Type':<25} {'Price ($)':<15} {'Payment'}")
+        print("-" * 95)
+        for r in rows:
+            buyer, target, deal_type, price, payment, acc, context = r
+            p_str = f"${price:,.0f}" if price else "N/A"
+            print(f"{buyer:<8} {target[:30]:<30} {deal_type:<25} {p_str:<15} {payment}")
+    print("===========================================\n")
 
 
 def run_continuous_service(config: Config, poll_interval_seconds: int = 60) -> None:
@@ -144,7 +168,6 @@ def run_continuous_service(config: Config, poll_interval_seconds: int = 60) -> N
         cycle += 1
 
 
-
 def main() -> None:
     config = Config.load()
     args = sys.argv[1:]
@@ -157,6 +180,8 @@ def main() -> None:
         run_single_sync(config)
     elif command in ("grade", "score"):
         run_grading(config)
+    elif command in ("transactions", "deals", "purchases"):
+        print_transactions(config)
     elif command in ("inspect", "show", "view"):
         target = args[1] if len(args) > 1 else "NVDA"
         inspect_filing(config, target)
@@ -164,8 +189,9 @@ def main() -> None:
         run_continuous_service(config)
     else:
         print(f"Unknown command: {command}")
-        print("Usage: python main.py [status|sync|grade|inspect <ticker>|run]")
+        print("Usage: python main.py [status|sync|grade|transactions|inspect <ticker>|run]")
         sys.exit(1)
+
 
 
 if __name__ == "__main__":

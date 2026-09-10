@@ -12,6 +12,7 @@ from sec_service import database
 from sec_service.parser import FilingParser
 from sec_service.extractor import FilingExtractor
 from sec_service.grader import FilingGrader
+from sec_service.transaction_extractor import TransactionExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -19,11 +20,13 @@ logger = logging.getLogger(__name__)
 class FilingGradingPipeline:
     """Orchestrates parsing, metric extraction, and grading for filings stored in DuckDB."""
 
-    def __init__(self, config: Config) -> None:
-        self.config = config
+    def __init__(self, config: Config | None = None) -> None:
+        self.config = config or Config.load()
         self.parser = FilingParser()
         self.extractor = FilingExtractor()
         self.grader = FilingGrader()
+        self.txn_extractor = TransactionExtractor()
+
 
     def run_grading_pass(self, max_filings: int = 50) -> Dict[str, Any]:
         """Fetch ungraded filings from database, parse, extract metrics, grade, and write back results."""
@@ -65,6 +68,15 @@ class FilingGradingPipeline:
                     for name, val in metrics.items()
                 ]
                 database.upsert_metrics(con, metric_rows)
+
+                # 3b. Extract corporate B2B purchases & M&A transactions
+                txns = self.txn_extractor.extract_transactions(clean_text, sections, ticker=ticker)
+                txn_rows = [
+                    (acc, t["buyer_ticker"], t["seller_target_name"], t["transaction_type"], t["purchase_price_usd"], t["consideration_type"], t["context_summary"])
+                    for t in txns
+                ]
+                database.upsert_transactions(con, txn_rows)
+
 
 
                 # 4. Compute grade

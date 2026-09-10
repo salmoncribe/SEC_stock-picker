@@ -35,7 +35,7 @@ class TransactionExtractor:
         if not text:
             return transactions
 
-        # Regex patterns for corporate purchases and acquisitions
+        # Regex patterns for corporate purchases, acquisitions, and commercial vendor deals
         patterns = [
             # Pattern 1: Acquired / Purchased [Company] for $[Amount]
             (
@@ -52,7 +52,20 @@ class TransactionExtractor:
                 r"(?:completed\s+the\s+acquisition\s+of)\s+([A-Z][A-Za-z0-9\.\&]{1,40}(?:\s+[A-Z][A-Za-z0-9\.\&]{1,40})*)(?:\s+(?:for|valued\s+at)\s+(\$\s*[\d\,\.]+\s*(?:billion|million|thousand)?))?",
                 "Acquisition",
             ),
+            # Pattern 4: Purchased / Buy [products/chips] from [Supplier]
+            (
+                r"(?:purchased|purchase|purchasing|procured|buy|buying)\s+(?:[A-Za-z0-9\s]{2,80}?)\s+from\s+([A-Z][A-Za-z0-9\.\&]{1,40}(?:\s+[A-Z][A-Za-z0-9\.\&]{1,40})*)(?:\s+(?:for|valued\s+at|totaling)\s+(\$\s*[\d\,\.]+\s*(?:billion|million|thousand)?))?",
+                "Vendor Commercial Purchase",
+            ),
+
+
+            # Pattern 5: Supply / Vendor Agreement with [Supplier]
+            (
+                r"(?:master\s+supply\s+agreement|commercial\s+supply\s+contract|vendor\s+agreement)\s+with\s+([A-Z][A-Za-z0-9\.\&]{1,40}(?:\s+[A-Z][A-Za-z0-9\.\&]{1,40})*)(?:\s+(?:for|valued\s+at|totaling)\s+(\$\s*[\d\,\.]+\s*(?:billion|million|thousand)?))?",
+                "Commercial Supply Agreement",
+            ),
         ]
+
 
 
         seen_targets = set()
@@ -64,7 +77,8 @@ class TransactionExtractor:
                 price_snippet = groups[1] if len(groups) > 1 and groups[1] else ""
 
                 # Filter out generic words
-                target_clean = re.sub(r"\s+(?:for|with|and|in|on|at|by|the|a|an)$", "", target_raw, flags=re.IGNORECASE)
+                target_clean = re.sub(r"\s+(?:totaling|valued|for|with|and|in|on|at|by|the|a|an|from)$", "", target_raw, flags=re.IGNORECASE)
+
                 if len(target_clean) < 3 or target_clean.lower() in {"the company", "a company", "certain assets", "all assets", "substantially all"}:
                     continue
 

@@ -39,6 +39,13 @@ logs/**/*.log
 # dirty tree after every scheduled job.
 logs/*.lock
 logs/*_state.json
+*.lock/
+*.lock
+
+# ---- Heavy research outputs / temporary runtime dirs ----
+docs/research/*.csv
+.claude/
+.remember/
 
 # ---- OS / editor ----
 .DS_Store

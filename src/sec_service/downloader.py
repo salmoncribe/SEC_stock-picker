@@ -112,7 +112,12 @@ class SECDownloaderService:
         )
         return True
 
-    def run_sync_pass(self, max_companies: int = 20, limit_per_company: int = 10) -> dict[str, int]:
+    def run_sync_pass(
+        self,
+        max_companies: int = 500,
+        limit_per_company: int = 100,
+        docs_per_company: int = 50,
+    ) -> dict[str, int]:
         """One complete pass: sync tickers, pick target companies, download filings & primary documents."""
         sync_id = uuid.uuid4().hex[:8]
         tickers_synced = self.sync_ticker_map()
@@ -123,21 +128,25 @@ class SECDownloaderService:
         with database.connection(self.config.db_path) as con:
             database.init_db(con)
             # Pick companies to download
-            ciks = [row[0] for row in con.execute("SELECT cik FROM companies LIMIT ?", [max_companies]).fetchall()]
+            query = "SELECT cik FROM companies" if max_companies <= 0 else "SELECT cik FROM companies LIMIT ?"
+            params = [] if max_companies <= 0 else [max_companies]
+            ciks = [row[0] for row in con.execute(query, params).fetchall()]
 
             with SECClient(self.config.sec_user_agent, self.config.requests_per_second) as client:
                 for cik in ciks:
                     f_count = self.download_filings_for_cik(client, con, cik, limit=limit_per_company)
                     total_filings += f_count
 
-                    # Get filings of ALL forms that don't have documents downloaded yet
-                    unIngested = con.execute("""
+                    doc_query = """
                         SELECT f.cik, f.accession_number, f.primary_document, f.form
                         FROM filings f
                         LEFT JOIN filing_documents d ON d.accession_number = f.accession_number
                         WHERE f.cik = ? AND f.primary_document IS NOT NULL AND f.primary_document != '' AND d.accession_number IS NULL
-                        LIMIT 5
-                    """, [cik]).fetchall()
+                    """
+                    if docs_per_company > 0:
+                        doc_query += f" LIMIT {docs_per_company}"
+
+                    unIngested = con.execute(doc_query, [cik]).fetchall()
 
                     for row in unIngested:
                         if self.download_document(client, con, row[0], row[1], row[2], form=row[3] or ""):
@@ -148,7 +157,7 @@ class SECDownloaderService:
         # Automatically grade all pulled filings immediately
         from sec_service.pipeline import FilingGradingPipeline
         pipeline = FilingGradingPipeline(self.config)
-        grade_result = pipeline.run_grading_pass(max_filings=500)
+        grade_result = pipeline.run_grading_pass(max_filings=5000)
         graded_count = grade_result.get("graded_count", 0)
 
         return {
@@ -157,4 +166,5 @@ class SECDownloaderService:
             "documents_downloaded": total_docs,
             "filings_graded": graded_count,
         }
+
 

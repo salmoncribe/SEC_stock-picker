@@ -116,7 +116,7 @@ def inspect_filing(config: Config, target: str) -> None:
 
 
 def run_continuous_service(config: Config, poll_interval_seconds: int = 60) -> None:
-    logger.info("Starting SEC Continuous Downloader Service...")
+    logger.info("Starting SEC Continuous Downloader & Instant Grading Service...")
     logger.info(f"Using SEC User-Agent: {config.sec_user_agent}")
     logger.info(f"Target DB: {config.db_path}")
     service = SECDownloaderService(config)
@@ -125,12 +125,13 @@ def run_continuous_service(config: Config, poll_interval_seconds: int = 60) -> N
     while True:
         logger.info(f"--- Starting Sync Cycle #{cycle} ---")
         try:
-            result = service.run_sync_pass(max_companies=50, limit_per_company=20)
+            result = service.run_sync_pass(max_companies=0, limit_per_company=100, docs_per_company=50)
             logger.info(
                 f"Cycle #{cycle} complete: "
                 f"{result['tickers_synced']} tickers synced, "
                 f"{result['filings_collected']} filings collected, "
-                f"{result['documents_downloaded']} docs downloaded."
+                f"{result['documents_downloaded']} docs downloaded, "
+                f"{result['filings_graded']} filings graded."
             )
         except KeyboardInterrupt:
             logger.info("Service stopped by user.")
@@ -141,6 +142,7 @@ def run_continuous_service(config: Config, poll_interval_seconds: int = 60) -> N
         logger.info(f"Sleeping for {poll_interval_seconds} seconds before next cycle...")
         time.sleep(poll_interval_seconds)
         cycle += 1
+
 
 
 def main() -> None:

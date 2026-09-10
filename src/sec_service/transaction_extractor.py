@@ -37,22 +37,23 @@ class TransactionExtractor:
 
         # Regex patterns for corporate purchases and acquisitions
         patterns = [
-            # Pattern 1: Acquired [Company] for $[Amount]
+            # Pattern 1: Acquired / Purchased [Company] for $[Amount]
             (
-                r"(?:acquired|acquire|purchased|purchase)\s+([A-Z][A-Za-z0-9\s\,\.\&]{2,40}?)\s+(?:for|at)\s+(?:a\s+purchase\s+price\s+of\s+)?(\$\s*[\d\,\.]+\s*(?:billion|million|thousand)?)",
+                r"(?:acquired|acquire|purchased|purchase)\s+([A-Z][A-Za-z0-9\.\&]{1,40}(?:\s+[A-Z][A-Za-z0-9\.\&]{1,40})*)\s+(?:for|at|valued\s+at)\s+(\$\s*[\d\,\.]+\s*(?:billion|million|thousand)?)",
                 "Acquisition",
             ),
             # Pattern 2: Entered into an agreement to acquire [Company] for $[Amount]
             (
-                r"(?:entered\s+into\s+(?:an?\s+)?(?:definitive\s+)?agreement\s+(?:to\s+acquire|with))\s+([A-Z][A-Za-z0-9\s\,\.\&]{2,40}?)\s+(?:for|valued\s+at)\s+(\$\s*[\d\,\.]+\s*(?:billion|million|thousand)?)",
+                r"(?:entered\s+into\s+(?:an?\s+)?(?:definitive\s+)?agreement\s+(?:to\s+acquire|with))\s+([A-Z][A-Za-z0-9\.\&]{1,40}(?:\s+[A-Z][A-Za-z0-9\.\&]{1,40})*)\s+(?:for|valued\s+at)\s+(\$\s*[\d\,\.]+\s*(?:billion|million|thousand)?)",
                 "Material Purchase Agreement",
             ),
-            # Pattern 3: Completed the acquisition of [Company]
+            # Pattern 3: Completed the acquisition of [Company] for $[Amount]
             (
-                r"(?:completed\s+the\s+acquisition\s+of)\s+([A-Z][A-Za-z0-9\s\,\.\&]{2,40}?)(?:\s+(?:for|valued\s+at)\s+(\$\s*[\d\,\.]+\s*(?:billion|million|thousand)?))?",
+                r"(?:completed\s+the\s+acquisition\s+of)\s+([A-Z][A-Za-z0-9\.\&]{1,40}(?:\s+[A-Z][A-Za-z0-9\.\&]{1,40})*)(?:\s+(?:for|valued\s+at)\s+(\$\s*[\d\,\.]+\s*(?:billion|million|thousand)?))?",
                 "Acquisition",
             ),
         ]
+
 
         seen_targets = set()
 
@@ -78,7 +79,11 @@ class TransactionExtractor:
                 end = min(len(text), match.end() + 150)
                 context = text[start:end].replace("\n", " ").strip()
 
+                if price_val is None:
+                    price_val = self._parse_dollar_amount(context)
+
                 consideration = "Unknown"
+
                 context_lower = context.lower()
                 if "cash" in context_lower and ("stock" in context_lower or "shares" in context_lower):
                     consideration = "Mixed (Cash & Stock)"

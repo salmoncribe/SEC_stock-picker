@@ -50,7 +50,9 @@ def run_single_sync(config: Config) -> None:
     print(f"Tickers Synced:       {result['tickers_synced']:,}")
     print(f"Filings Collected:    {result['filings_collected']:,}")
     print(f"Documents Downloaded: {result['documents_downloaded']:,}")
+    print(f"Filings Graded:       {result.get('filings_graded', 0):,}")
     print("===============================\n")
+
 
 
 def run_grading(config: Config, max_filings: int = 50) -> None:

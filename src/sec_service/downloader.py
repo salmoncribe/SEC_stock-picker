@@ -145,9 +145,16 @@ class SECDownloaderService:
 
             database.log_sync(con, sync_id, "run_sync_pass", total_filings + total_docs, "success")
 
+        # Automatically grade all pulled filings immediately
+        from sec_service.pipeline import FilingGradingPipeline
+        pipeline = FilingGradingPipeline(self.config)
+        grade_result = pipeline.run_grading_pass(max_filings=500)
+        graded_count = grade_result.get("graded_count", 0)
 
         return {
             "tickers_synced": tickers_synced,
             "filings_collected": total_filings,
             "documents_downloaded": total_docs,
+            "filings_graded": graded_count,
         }
+

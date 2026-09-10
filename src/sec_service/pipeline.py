@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Dict, Any
+
 
 from sec_service.config import Config
 from sec_service import database
@@ -57,12 +59,13 @@ class FilingGradingPipeline:
                 database.upsert_sections(con, sec_rows)
 
                 # 3. Extract metrics
-                metrics = self.extractor.extract_metrics(clean_text)
+                metrics = self.extractor.extract_metrics(clean_text, sections=sections, form=form)
                 metric_rows = [
                     (acc, name, float(val) if isinstance(val, (int, float)) else None, str(val))
                     for name, val in metrics.items()
                 ]
                 database.upsert_metrics(con, metric_rows)
+
 
                 # 4. Compute grade
                 grade_res = self.grader.compute_grade(metrics, sections, form)
@@ -91,5 +94,7 @@ class FilingGradingPipeline:
                     "summary": grade_res["summary_notes"],
                 })
 
-            database.log_sync(con, "grade_pass", "run_grading_pass", len(graded_results), "success")
+            sync_id = uuid.uuid4().hex[:8]
+            database.log_sync(con, sync_id, "run_grading_pass", len(graded_results), "success")
             return {"graded_count": len(graded_results), "grades": graded_results}
+

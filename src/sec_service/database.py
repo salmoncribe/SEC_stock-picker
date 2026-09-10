@@ -97,6 +97,12 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
         ALTER TABLE filing_sections ADD COLUMN IF NOT EXISTS section_title TEXT;
         ALTER TABLE filing_sections ADD COLUMN IF NOT EXISTS extracted_at TIMESTAMPTZ;
 
+        UPDATE filing_documents
+        SET form = f.form
+        FROM filings f
+        WHERE filing_documents.accession_number = f.accession_number
+          AND (filing_documents.form IS NULL OR filing_documents.form = '');
+
         CREATE TABLE IF NOT EXISTS filing_metrics (
             metric_id TEXT PRIMARY KEY,
             filing_id TEXT,
@@ -172,19 +178,21 @@ def upsert_filings(con: duckdb.DuckDBPyConnection, rows: list[tuple[str, str, st
     return len(rows)
 
 
-def upsert_document(con: duckdb.DuckDBPyConnection, accession_number: str, cik: str, document_name: str, url: str, byte_size: int, raw_path: str) -> None:
+def upsert_document(con: duckdb.DuckDBPyConnection, accession_number: str, cik: str, document_name: str, url: str, byte_size: int, raw_path: str, form: str = "") -> None:
     now = datetime.now(timezone.utc)
     doc_id = hash_id("doc", accession_number, document_name)
     company_id = hash_id("company", cik)
     filing_id = hash_id("filing", accession_number)
     con.execute("""
-        INSERT INTO filing_documents (document_id, filing_id, company_id, cik, accession_number, document_name, document_url, byte_size, raw_file_path, collected_time)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO filing_documents (document_id, filing_id, company_id, cik, accession_number, form, document_name, document_url, byte_size, raw_file_path, collected_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (accession_number, document_name) DO UPDATE SET
+            form = EXCLUDED.form,
             byte_size = EXCLUDED.byte_size,
             raw_file_path = EXCLUDED.raw_file_path,
             collected_time = EXCLUDED.collected_time
-    """, [doc_id, filing_id, company_id, cik, accession_number, document_name, url, byte_size, raw_path, now])
+    """, [doc_id, filing_id, company_id, cik, accession_number, form, document_name, url, byte_size, raw_path, now])
+
 
 
 def upsert_sections(con: duckdb.DuckDBPyConnection, rows: list[tuple[str, str, str, str, int]]) -> int:

@@ -79,7 +79,7 @@ class SECDownloaderService:
 
         return database.upsert_filings(con, rows)
 
-    def download_document(self, client: SECClient, con: Any, cik: str, accession_number: str, primary_doc: str) -> bool:
+    def download_document(self, client: SECClient, con: Any, cik: str, accession_number: str, primary_doc: str, form: str = "") -> bool:
         """Download raw filing document bytes, save to data/raw/sec/, and log in DB."""
         if not primary_doc:
             return False
@@ -108,6 +108,7 @@ class SECDownloaderService:
             url=url,
             byte_size=len(doc_bytes),
             raw_path=str(file_path),
+            form=form,
         )
         return True
 
@@ -129,20 +130,21 @@ class SECDownloaderService:
                     f_count = self.download_filings_for_cik(client, con, cik, limit=limit_per_company)
                     total_filings += f_count
 
-                    # Get 10-K and 10-Q filings that don't have documents downloaded yet
+                    # Get filings of ALL forms that don't have documents downloaded yet
                     unIngested = con.execute("""
-                        SELECT f.cik, f.accession_number, f.primary_document
+                        SELECT f.cik, f.accession_number, f.primary_document, f.form
                         FROM filings f
                         LEFT JOIN filing_documents d ON d.accession_number = f.accession_number
-                        WHERE f.cik = ? AND f.form IN ('10-K', '10-Q', '8-K') AND d.accession_number IS NULL
+                        WHERE f.cik = ? AND f.primary_document IS NOT NULL AND f.primary_document != '' AND d.accession_number IS NULL
                         LIMIT 5
                     """, [cik]).fetchall()
 
                     for row in unIngested:
-                        if self.download_document(client, con, row[0], row[1], row[2]):
+                        if self.download_document(client, con, row[0], row[1], row[2], form=row[3] or ""):
                             total_docs += 1
 
             database.log_sync(con, sync_id, "run_sync_pass", total_filings + total_docs, "success")
+
 
         return {
             "tickers_synced": tickers_synced,

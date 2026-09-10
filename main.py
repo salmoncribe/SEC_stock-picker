@@ -67,6 +67,52 @@ def run_grading(config: Config, max_filings: int = 50) -> None:
     print("====================================\n")
 
 
+def inspect_filing(config: Config, target: str) -> None:
+    with database.connection(config.db_path, read_only=True) as con:
+        grades = con.execute("""
+
+            SELECT g.ticker, g.form, g.accession_number, g.overall_grade, g.overall_score, g.summary_notes
+            FROM filing_grades g
+            WHERE UPPER(g.ticker) = UPPER(?) OR g.accession_number = ?
+            LIMIT 5
+        """, [target, target]).fetchall()
+
+        if not grades:
+            print(f"\nNo graded filings found for '{target}'. Run 'python main.py grade' first.")
+            return
+
+        for row in grades:
+            ticker, form, acc, grade, score, summary = row
+            print(f"\n==================================================")
+            print(f"  Filing Inspection: {ticker} ({form}) - Accession {acc}")
+            print(f"  Grade: {grade} | Composite Score: {score}/100")
+            print(f"  Summary Notes: {summary}")
+            print(f"==================================================")
+
+            # Print metrics
+            metrics = con.execute("""
+                SELECT metric_name, metric_value, text_value
+                FROM filing_metrics
+                WHERE accession_number = ? AND (metric_value IS NOT NULL OR (text_value IS NOT NULL AND text_value != ''))
+            """, [acc]).fetchall()
+            print("\n  [Extracted Financial & Text Metrics]:")
+            for m in metrics:
+                val = f"{m[1]:,.2f}" if isinstance(m[1], float) else (m[2] or str(m[1]))
+                print(f"    - {m[0]:<28}: {val}")
+
+            # Print section list
+            sections = con.execute("""
+                SELECT section_name, word_count, left(clean_text, 120)
+                FROM filing_sections
+                WHERE accession_number = ?
+            """, [acc]).fetchall()
+            print("\n  [Extracted Document Sections]:")
+            for s in sections:
+                sample = (s[2] or "").replace("\n", " ")
+                print(f"    - {s[0]} ({s[1]} words): {sample}...")
+            print("\n")
+
+
 def run_continuous_service(config: Config, poll_interval_seconds: int = 60) -> None:
     logger.info("Starting SEC Continuous Downloader Service...")
     logger.info(f"Using SEC User-Agent: {config.sec_user_agent}")
@@ -107,14 +153,16 @@ def main() -> None:
         run_single_sync(config)
     elif command in ("grade", "score"):
         run_grading(config)
+    elif command in ("inspect", "show", "view"):
+        target = args[1] if len(args) > 1 else "NVDA"
+        inspect_filing(config, target)
     elif command in ("run", "service", "daemon"):
         run_continuous_service(config)
     else:
         print(f"Unknown command: {command}")
-        print("Usage: python main.py [status|sync|grade|run]")
+        print("Usage: python main.py [status|sync|grade|inspect <ticker>|run]")
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-

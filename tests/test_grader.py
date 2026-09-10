@@ -85,3 +85,23 @@ def test_grader_scoring():
     assert result["overall_grade"] in ["A+", "A", "B+", "B"]
     assert result["overall_score"] > 80.0
     assert "Positive management tone" in result["summary_notes"]
+
+
+def test_financial_extractor():
+    from sec_service.financial_extractor import FinancialExtractor
+    fin = FinancialExtractor()
+    sample_filing = """
+    UNITED STATES SECURITIES AND EXCHANGE COMMISSION
+    FORM 10-Q
+    Total Net Revenues were $ 25.4 billion for the quarter.
+    Net Income was $ 5.2 billion.
+    Diluted Earnings Per Share was $ 1.25.
+    Item 5.02 Departure of Directors or Certain Officers.
+    On August 17, 2026, Mr. Joe Householder provided notice of his intention to retire from the Board of Directors.
+    """
+    res = fin.extract_financial_data(sample_filing, {})
+    assert res.get("revenue_usd") == 25_400_000_000.0
+    assert res.get("net_income_usd") == 5_200_000_000.0
+    assert res.get("eps_diluted") == 1.25
+    assert "retire from the Board" in res.get("executive_event_summary", "")
+

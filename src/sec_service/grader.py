@@ -75,6 +75,16 @@ class FilingGrader:
 
         # 6. Generate Summary Notes
         notes = []
+
+        if "revenue_text" in metrics:
+            notes.append(f"Revenue Signal: {metrics['revenue_text']}")
+        if "net_income_text" in metrics:
+            notes.append(f"Net Income Signal: {metrics['net_income_text']}")
+        if "eps_diluted" in metrics:
+            notes.append(f"Diluted EPS: ${metrics['eps_diluted']}")
+        if "executive_event_summary" in metrics:
+            notes.append(f"Executive Event: {metrics['executive_event_summary'][:120]}...")
+
         if net_sentiment > 0.1:
             notes.append("Positive management tone in filing discussion.")
         elif net_sentiment < -0.05:
@@ -96,5 +106,6 @@ class FilingGrader:
             "sentiment_score": round(sentiment_score, 1),
             "transparency_score": round(transparency_score, 1),
             "financial_score": round(financial_score, 1),
-            "summary_notes": "; ".join(notes),
+            "summary_notes": " | ".join(notes),
         }
+

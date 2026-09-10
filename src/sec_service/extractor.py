@@ -5,9 +5,15 @@ from __future__ import annotations
 import re
 from typing import Dict, Any
 
+from sec_service.financial_extractor import FinancialExtractor
+
+
 
 class FilingExtractor:
     """Extracts text statistics, sentiment scores, readability metrics, and quantitative signals from filing text."""
+
+    def __init__(self) -> None:
+        self.fin_extractor = FinancialExtractor()
 
     POSITIVE_WORDS = {
         "increase", "increased", "increasing", "growth", "strong", "profitable", "profitability",
@@ -49,10 +55,13 @@ class FilingExtractor:
         matches = re.findall(r'[aeiouy]{1,2}', word)
         return max(1, len(matches))
 
-    def extract_metrics(self, text: str) -> Dict[str, Any]:
-        """Compute textual metrics, sentiment metrics, and readability indicators from filing text."""
+    def extract_metrics(self, text: str, sections: Dict[str, str] | None = None, form: str = "") -> Dict[str, Any]:
+        """Compute textual metrics, sentiment metrics, readability indicators, and concrete financial numbers from filing text."""
+        sections = sections or {}
+        fin_data = self.fin_extractor.extract_financial_data(text, sections, form=form)
+
         if not text:
-            return {
+            res = {
                 "word_count": 0,
                 "sentence_count": 0,
                 "positive_count": 0,
@@ -64,6 +73,8 @@ class FilingExtractor:
                 "flesch_reading_ease": 0.0,
                 "complex_word_ratio": 0.0,
             }
+            res.update(fin_data)
+            return res
 
         # Tokenize words and sentences
         words = re.findall(r"\b[a-zA-Z]+\b", text.lower())
@@ -73,7 +84,7 @@ class FilingExtractor:
         sentence_count = max(1, len(sentences))
 
         if word_count == 0:
-            return {
+            res = {
                 "word_count": 0,
                 "sentence_count": sentence_count,
                 "positive_count": 0,
@@ -85,6 +96,8 @@ class FilingExtractor:
                 "flesch_reading_ease": 0.0,
                 "complex_word_ratio": 0.0,
             }
+            res.update(fin_data)
+            return res
 
         pos_count = sum(1 for w in words if w in self.POSITIVE_WORDS)
         neg_count = sum(1 for w in words if w in self.NEGATIVE_WORDS)
@@ -106,7 +119,7 @@ class FilingExtractor:
         flesch_ease = 206.835 - (1.015 * avg_words_per_sentence) - (84.6 * (total_syllables / word_count))
         flesch_ease = max(0.0, min(100.0, flesch_ease))
 
-        return {
+        res = {
             "word_count": word_count,
             "sentence_count": sentence_count,
             "positive_count": pos_count,
@@ -118,3 +131,6 @@ class FilingExtractor:
             "flesch_reading_ease": round(flesch_ease, 2),
             "complex_word_ratio": round(complex_word_ratio, 4),
         }
+        res.update(fin_data)
+        return res
+

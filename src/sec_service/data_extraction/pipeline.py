@@ -9,10 +9,11 @@ from typing import Dict, Any
 
 from sec_service.config import Config
 from sec_service import database
-from sec_service.parser import FilingParser
-from sec_service.extractor import FilingExtractor
-from sec_service.grader import FilingGrader
-from sec_service.transaction_extractor import TransactionExtractor
+from sec_service.data_extraction.parser import FilingParser
+from sec_service.data_extraction.extractor import FilingExtractor
+from sec_service.data_extraction.grader import FilingGrader
+from sec_service.data_extraction.transaction_extractor import TransactionExtractor
+
 
 logger = logging.getLogger(__name__)
 

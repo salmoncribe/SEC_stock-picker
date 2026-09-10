@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import duckdb
 from sec_service import database
-from sec_service.parser import FilingParser
-from sec_service.extractor import FilingExtractor
-from sec_service.grader import FilingGrader
+from sec_service.data_extraction import (
+    FilingParser,
+    FilingExtractor,
+    FinancialExtractor,
+    TransactionExtractor,
+    FilingGrader,
+)
+
 
 
 def test_database_init_and_tables():
@@ -88,7 +93,6 @@ def test_grader_scoring():
 
 
 def test_financial_extractor():
-    from sec_service.financial_extractor import FinancialExtractor
     fin = FinancialExtractor()
     sample_filing = """
     UNITED STATES SECURITIES AND EXCHANGE COMMISSION
@@ -107,13 +111,13 @@ def test_financial_extractor():
 
 
 def test_transaction_extractor():
-    from sec_service.transaction_extractor import TransactionExtractor
     txn_ext = TransactionExtractor()
     sample_text = """
     On July 12, 2026, the Company entered into a definitive agreement to acquire TechSystems Corp for $ 1.5 billion in cash.
     Additionally, the Company acquired DataCloud Inc for $ 350 million.
     """
     txns = txn_ext.extract_transactions(sample_text, {}, ticker="MSFT")
+
     assert len(txns) >= 1
     t0 = txns[0]
     assert t0["buyer_ticker"] == "MSFT"

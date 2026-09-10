@@ -5,7 +5,8 @@ from __future__ import annotations
 import re
 from typing import Dict, Any
 
-from sec_service.financial_extractor import FinancialExtractor
+from sec_service.data_extraction.financial_extractor import FinancialExtractor
+
 
 
 

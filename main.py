@@ -16,7 +16,8 @@ import time
 from sec_service.config import Config
 from sec_service import database
 from sec_service.downloader import SECDownloaderService
-from sec_service.pipeline import FilingGradingPipeline
+from sec_service.data_extraction.pipeline import FilingGradingPipeline
+
 
 logging.basicConfig(
     level=logging.INFO,
